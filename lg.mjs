@@ -41,6 +41,7 @@ const DEFAULT_OUT  = path.join(process.cwd(), "input.json");
 const LOGIN_URL  = "https://web.learning-genie.com/#/login";
 const PARENT_URL = "https://web.learning-genie.com/v2/#/parent";
 const NOTES_BASE = "https://api2.learning-genie.com/api/v1/Notes";
+const ENROLLMENTS_URL = "https://api2.learning-genie.com/api/v1/Enrollments";
 
 // polite defaults
 const DEFAULT_COUNT = 50;
@@ -101,7 +102,7 @@ program.command("fetch")
     const { storageState, savedHeaders } = loadAuthStateFile(auth);
     let request;
     try {
-      request = await createApiRequestContext({ storageState, savedHeaders });
+      ({ request } = await createApiRequestContext({ storageState, savedHeaders }));
     } catch (err) {
       console.error(err?.message || err);
       process.exit(4);
@@ -133,14 +134,14 @@ program.command("fetch")
 // ----- sync (one-shot) -----
 program.command("sync")
   .description("Login if needed → fetch Notes → run your bash downloader in one go")
-  .requiredOption("--enrollment <id>", "enrollment_id (GUID)")
+  .option("--enrollment <id>", "limit to a specific enrollment_id (GUID)")
   .option("--start <YYYY-MM-DD>", "start date (inclusive)")
   .option("--end <YYYY-MM-DD>", "end date (inclusive)")
   .option("--count <n>", "page size", `${DEFAULT_COUNT}`)
   .option("--note-category <name>", "note_category filter", "report")
   .option("--video-book", "include video_book=true", true)
   .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
-  .option("--outfile <file>", "intermediate JSON for your script", path.join(process.cwd(), "response.json"))
+  .option("--outfile <file>", "intermediate JSON for your script", DEFAULT_OUT)
   .option("--outdir <dir>", "final download directory", path.join(process.cwd(), "downloads"))
   .option("--script <path>", "path to your bash script", "./learning-genie-download.sh")
   .option("--raw-params <queryString>", "extra query params")
@@ -165,44 +166,96 @@ program.command("sync")
     // 2) Fetch date-range JSON
     const { storageState, savedHeaders } = loadAuthStateFile(opts.auth);
     let request;
+    let headers;
     try {
-      request = await createApiRequestContext({ storageState, savedHeaders });
+      ({ request, extraHTTPHeaders: headers } = await createApiRequestContext({ storageState, savedHeaders }));
     } catch (err) {
       console.error(err?.message || err);
       process.exit(4);
     }
     try {
-      const all = await fetchNotesRange({
-        request,
-        enrollmentId: opts.enrollment,
-        startDate: opts.start ? parseISO(opts.start) : undefined,
-        endDate:   opts.end   ? parseISO(opts.end)   : undefined,
-        pageSize: Number(opts.count ?? DEFAULT_COUNT),
-        noteCategory: opts.noteCategory ?? "report",
-        videoBook: opts.videoBook !== false,
-        rawParams: opts.rawParams ?? "",
-        maxPages: 200,
-        delayMs: DEFAULT_DELAY_MS
-      });
-      fs.writeFileSync(opts.outfile, JSON.stringify({ items: all }, null, 2));
-      console.log(`📄 Wrote ${all.length} items → ${opts.outfile}`);
+      const startDate = opts.start ? parseISO(opts.start) : undefined;
+      const endDate   = opts.end   ? parseISO(opts.end)   : undefined;
+      const pageSize = Number(opts.count ?? DEFAULT_COUNT);
+      const noteCategory = opts.noteCategory ?? "report";
+      const videoBook = opts.videoBook !== false;
+      const rawParams = opts.rawParams ?? "";
+
+      let enrollments;
+      try {
+        enrollments = await fetchParentEnrollments({ request, headers });
+      } catch (err) {
+        console.error("Failed to load enrollments:", err?.message || err);
+        process.exit(6);
+      }
+
+      if (!Array.isArray(enrollments) || enrollments.length === 0) {
+        console.error("No enrollments found for this account.");
+        process.exit(7);
+      }
+
+      let targetEnrollments = enrollments;
+      if (opts.enrollment) {
+        targetEnrollments = enrollments.filter(e => extractEnrollmentId(e) === opts.enrollment);
+        if (targetEnrollments.length === 0) {
+          console.error(`Enrollment ${opts.enrollment} not found for this parent.`);
+          process.exit(8);
+        }
+      }
+
+      const usedFolderNames = new Map();
+      const multi = targetEnrollments.length > 1;
+
+      for (const enrollment of targetEnrollments) {
+        const enrollmentId = extractEnrollmentId(enrollment);
+        if (!enrollmentId) {
+          console.warn("Skipping enrollment with missing id:", JSON.stringify(enrollment));
+          continue;
+        }
+
+        console.log(`📚 Fetching notes for enrollment ${enrollmentId} …`);
+        const items = await fetchNotesRange({
+          request,
+          enrollmentId,
+          startDate,
+          endDate,
+          pageSize,
+          noteCategory,
+          videoBook,
+          rawParams,
+          maxPages: 200,
+          delayMs: DEFAULT_DELAY_MS
+        });
+
+        const displayName = resolveEnrollmentDisplayName(enrollment, enrollmentId);
+        const folderBase = uniqueSlug(displayName, usedFolderNames);
+        const outfile = multi ? appendFileSuffix(opts.outfile, `-${folderBase}`) : opts.outfile;
+        const childOutdir = path.join(opts.outdir, folderBase);
+
+        fs.writeFileSync(outfile, JSON.stringify({ items }, null, 2));
+        console.log(`📄 [${displayName}] Wrote ${items.length} items → ${outfile}`);
+
+        if (items.length === 0) {
+          console.log(`ℹ️  [${displayName}] No media in range; skipping downloader.`);
+          continue;
+        }
+
+        await fs.promises.mkdir(childOutdir, { recursive: true }).catch(() => {});
+        console.log(`⬇️  [${displayName}] Running: ${opts.script} "${outfile}" "${childOutdir}"`);
+        try {
+          const { stdout, stderr } = await execFile(opts.script, [outfile, childOutdir], {
+            env: process.env
+          });
+          if (stdout) process.stdout.write(stdout);
+          if (stderr) process.stderr.write(stderr);
+          console.log(`✅ [${displayName}] Sync complete.`);
+        } catch (err) {
+          console.error(`Downloader script failed for ${displayName}:`, err?.stderr || err?.message || err);
+          process.exit(5);
+        }
+      }
     } finally {
       await request.dispose();
-    }
-
-    // 3) Run your bash pipeline
-    await fs.promises.mkdir(opts.outdir, { recursive: true }).catch(() => {});
-    console.log(`⬇️  Running: ${opts.script} "${opts.outfile}" "${opts.outdir}"`);
-    try {
-      const { stdout, stderr } = await execFile(opts.script, [opts.outfile, opts.outdir], {
-        env: process.env
-      });
-      if (stdout) process.stdout.write(stdout);
-      if (stderr) process.stderr.write(stderr);
-      console.log("✅ Sync complete.");
-    } catch (err) {
-      console.error("Downloader script failed:", err?.stderr || err?.message || err);
-      process.exit(5);
     }
   });
 
@@ -524,7 +577,8 @@ function loadAuthStateFile(authPath) {
 
 async function createApiRequestContext({ storageState, savedHeaders }) {
   const extraHTTPHeaders = buildApiHeaders({ storageState, savedHeaders });
-  return pwRequest.newContext({ storageState, extraHTTPHeaders });
+  const request = await pwRequest.newContext({ storageState, extraHTTPHeaders });
+  return { request, extraHTTPHeaders };
 }
 
 function buildNotesUrl({ enrollmentId, beforeTime, pageSize, noteCategory, videoBook, rawParams }) {
@@ -660,18 +714,26 @@ async function ensureAuthValid({ authPath, headless, username, password, enrollm
   if (!needLogin) {
     try {
       const { storageState, savedHeaders } = loadAuthStateFile(authPath);
-      const request = await createApiRequestContext({ storageState, savedHeaders });
+      const { request } = await createApiRequestContext({ storageState, savedHeaders });
       const tomorrow = addDays(new Date(), 1);
       tomorrow.setHours(0, 0, 0, 0);
-      const testUrl = buildNotesUrl({
-        enrollmentId,
-        beforeTime: formatForApi(tomorrow),
-        pageSize: 1,
-        noteCategory: "report",
-        videoBook: true,
-        rawParams: ""
-      });
-      const r = await request.get(testUrl);
+      let r;
+      if (enrollmentId) {
+        const testUrl = buildNotesUrl({
+          enrollmentId,
+          beforeTime: formatForApi(tomorrow),
+          pageSize: 1,
+          noteCategory: "report",
+          videoBook: true,
+          rawParams: ""
+        });
+        r = await request.get(testUrl);
+      } else {
+        // Fallback: call enrollments endpoint to verify auth
+        const headers = buildApiHeaders({ storageState, savedHeaders }, { allowMissingUid: true });
+        const enrollments = await fetchParentEnrollments({ request, headers });
+        r = { status: () => (Array.isArray(enrollments) ? 200 : 500) };
+      }
       await request.dispose();
       if (r.status() === 401 || r.status() === 403) needLogin = true;
     } catch (err) {
@@ -716,4 +778,71 @@ function deriveStableId(item) {
     ? item.media.map(m => m?.public_url ?? m?.id ?? "").join("|")
     : "";
   return `${ts}::${payload}::${mediaKey}`;
+}
+
+async function fetchParentEnrollments({ request, headers }) {
+  const parentId = getHeaderValue(headers, "x-uid") ?? process.env.LG_UID?.trim();
+  if (!parentId) {
+    throw new Error("Missing X-UID for enrollment lookup. Rerun `lg login` or set LG_UID env.");
+  }
+  const url = new URL(ENROLLMENTS_URL);
+  url.searchParams.set("parent_id", parentId);
+  const json = await robustGetJSON(request, url.toString());
+  if (!Array.isArray(json)) {
+    throw new Error("Unexpected enrollments response shape.");
+  }
+  return json;
+}
+
+function extractEnrollmentId(enrollment) {
+  return enrollment?.id ?? enrollment?.enrollment_id ?? enrollment?.enrollmentId ?? null;
+}
+
+function resolveEnrollmentDisplayName(enrollment, fallbackId) {
+  const candidates = [
+    enrollment?.first_name,
+    enrollment?.firstName,
+    enrollment?.display_name,
+    enrollment?.displayName,
+    enrollment?.child?.first_name,
+    enrollment?.child?.display_name
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return fallbackId || "child";
+}
+
+function uniqueSlug(name, used) {
+  const base = slugifyName(name) || "child";
+  const count = used.get(base) ?? 0;
+  used.set(base, count + 1);
+  if (count === 0) return base;
+  return `${base}-${count + 1}`;
+}
+
+function slugifyName(value) {
+  if (!value) return "";
+  const ascii = value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^\x00-\x7F]/g, "");
+  return ascii
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function appendFileSuffix(filePath, suffix) {
+  const ext = path.extname(filePath);
+  const base = path.basename(filePath, ext);
+  const dir = path.dirname(filePath);
+  return path.join(dir, `${base}${suffix}${ext}`);
+}
+
+function getHeaderValue(headers, name) {
+  if (!headers) return undefined;
+  if (headers[name] != null) return headers[name];
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === target) return value;
+  }
+  return undefined;
 }
