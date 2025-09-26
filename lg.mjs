@@ -24,7 +24,7 @@ import { chromium, request as pwRequest } from "playwright";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { addDays, isAfter, isBefore, parseISO, subMilliseconds, format } from "date-fns";
+import { addDays, addMilliseconds, isAfter, isBefore, parseISO, subMilliseconds, format } from "date-fns";
 import { execFile as _execFile } from "child_process";
 import { promisify } from "util";
 
@@ -50,6 +50,11 @@ const MAX_RETRIES = 4;
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
 
 let lastTimezoneOffsetHours = null;
+
+const MEDIA_EXTENSIONS = new Set([
+  "jpg", "jpeg", "heic", "png", "webp", "gif",
+  "mp4", "mov", "m4v", "avi", "mts"
+]);
 
 // -------------------- CLI definition --------------------
 
@@ -213,11 +218,33 @@ program.command("sync")
           continue;
         }
 
+        const displayName = resolveEnrollmentDisplayName(enrollment, enrollmentId);
+        const folderBase = uniqueSlug(displayName, usedFolderNames);
+        const childOutdir = path.join(opts.outdir, folderBase);
+
+        const timezone = resolveEnrollmentTimezone({ enrollment, headers });
+        if (timezone) {
+          console.log(`🌐 [${displayName}] Using timezone ${timezone} for EXIF metadata`);
+        }
+
+        const lastCaptured = findLatestCaptureTimestamp(childOutdir);
+        const derivedStart = lastCaptured ? addMilliseconds(lastCaptured, 1) : undefined;
+        const effectiveStart = selectEffectiveStartDate(startDate, derivedStart);
+
+        if (lastCaptured) {
+          console.log(`🕒 [${displayName}] Last captured at ${lastCaptured.toISOString()} (downloaded media)`);
+        }
+        if (effectiveStart) {
+          const usingDerived = derivedStart && effectiveStart.getTime() === derivedStart.getTime();
+          const sourceLabel = usingDerived ? "derived" : (startDate ? "user" : "default");
+          console.log(`📆 [${displayName}] Using start time ${effectiveStart.toISOString()} (${sourceLabel})`);
+        }
+
         console.log(`📚 Fetching notes for enrollment ${enrollmentId} …`);
         const items = await fetchNotesRange({
           request,
           enrollmentId,
-          startDate,
+          startDate: effectiveStart,
           endDate,
           pageSize,
           noteCategory,
@@ -227,10 +254,7 @@ program.command("sync")
           delayMs: DEFAULT_DELAY_MS
         });
 
-        const displayName = resolveEnrollmentDisplayName(enrollment, enrollmentId);
-        const folderBase = uniqueSlug(displayName, usedFolderNames);
         const outfile = multi ? appendFileSuffix(opts.outfile, `-${folderBase}`) : opts.outfile;
-        const childOutdir = path.join(opts.outdir, folderBase);
 
         fs.writeFileSync(outfile, JSON.stringify({ items }, null, 2));
         console.log(`📄 [${displayName}] Wrote ${items.length} items → ${outfile}`);
@@ -243,8 +267,10 @@ program.command("sync")
         await fs.promises.mkdir(childOutdir, { recursive: true }).catch(() => {});
         console.log(`⬇️  [${displayName}] Running: ${opts.script} "${outfile}" "${childOutdir}"`);
         try {
+          const env = { ...process.env };
+          if (timezone) env.LOCAL_TZ = timezone;
           const { stdout, stderr } = await execFile(opts.script, [outfile, childOutdir], {
-            env: process.env
+            env
           });
           if (stdout) process.stdout.write(stdout);
           if (stderr) process.stderr.write(stderr);
@@ -845,4 +871,74 @@ function getHeaderValue(headers, name) {
     if (key.toLowerCase() === target) return value;
   }
   return undefined;
+}
+
+function resolveEnrollmentTimezone({ enrollment, headers }) {
+  const candidates = [
+    enrollment?.center?.timezone,
+    enrollment?.group?.timezone,
+    enrollment?.timezone,
+    enrollment?.timeZone,
+    enrollment?.child?.timezone,
+    enrollment?.child?.timeZone
+  ];
+  for (const tz of candidates) {
+    if (typeof tz === "string" && tz.trim()) return tz.trim();
+  }
+
+  const offsetHeader = getHeaderValue(headers, "x-lg-timezoneoffset");
+  if (offsetHeader && offsetHeader !== "null") {
+    const num = Number(offsetHeader);
+    if (!Number.isNaN(num)) {
+      const tz = offsetHoursToTimezone(num);
+      if (tz) return tz;
+    }
+  }
+
+  if (process.env.LOCAL_TZ && process.env.LOCAL_TZ.trim()) {
+    return process.env.LOCAL_TZ.trim();
+  }
+
+  return null;
+}
+
+function offsetHoursToTimezone(offsetHours) {
+  if (!Number.isFinite(offsetHours)) return null;
+  const inverted = -offsetHours;
+  const suffix = inverted >= 0 ? `+${inverted}` : `${inverted}`;
+  return `Etc/GMT${suffix}`;
+}
+
+function selectEffectiveStartDate(userStart, derivedStart) {
+  if (!userStart) return derivedStart ?? undefined;
+  if (!derivedStart) return userStart;
+  return isAfter(userStart, derivedStart) ? userStart : derivedStart;
+}
+
+function findLatestCaptureTimestamp(dir) {
+  if (!dir) return null;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  let latest = null;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const ext = entry.name.split(".").pop();
+    if (!ext || !MEDIA_EXTENSIONS.has(ext.toLowerCase())) continue;
+    const fullPath = path.join(dir, entry.name);
+    let stats;
+    try {
+      stats = fs.statSync(fullPath);
+    } catch {
+      continue;
+    }
+    const mtime = stats.mtime;
+    if (!latest || mtime > latest) {
+      latest = mtime;
+    }
+  }
+  return latest;
 }
