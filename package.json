@@ -1,0 +1,16 @@
+{
+  "name": "learning-genie-cli",
+  "version": "0.1.1",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "commander": "^12.1.0",
+    "date-fns": "^4.1.0",
+    "playwright": "^1.47.2"
+  },
+  "scripts": {
+    "login": "node ./lg.mjs login",
+    "fetch": "node ./lg.mjs fetch",
+    "sync":  "node ./lg.mjs sync"
+  }
+}
