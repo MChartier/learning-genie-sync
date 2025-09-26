@@ -24,7 +24,7 @@ import { chromium, request as pwRequest } from "playwright";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { addDays, isAfter, isBefore, parseISO } from "date-fns";
+import { addDays, isAfter, isBefore, parseISO, subMilliseconds, format } from "date-fns";
 import { execFile as _execFile } from "child_process";
 import { promisify } from "util";
 
@@ -36,7 +36,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_AUTH = path.join(__dirname, "auth.storage.json");
-const DEFAULT_OUT  = path.join(process.cwd(), "response.json");
+const DEFAULT_OUT  = path.join(process.cwd(), "input.json");
 
 const LOGIN_URL  = "https://web.learning-genie.com/#/login";
 const PARENT_URL = "https://web.learning-genie.com/v2/#/parent";
@@ -47,6 +47,8 @@ const DEFAULT_COUNT = 50;
 const DEFAULT_DELAY_MS = 350; // between API calls
 const MAX_RETRIES = 4;
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
+
+let lastTimezoneOffsetHours = null;
 
 // -------------------- CLI definition --------------------
 
@@ -284,6 +286,89 @@ async function loginAndSaveState({ username, password, authPath, headless }) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function formatForApi(date, { treatAsUTC = false } = {}) {
+  if (treatAsUTC) {
+    if (typeof lastTimezoneOffsetHours === "number" && Number.isFinite(lastTimezoneOffsetHours)) {
+      const localDate = new Date(date.getTime() + lastTimezoneOffsetHours * 60 * 60 * 1000);
+      return format(localDate, "yyyy-MM-dd HH:mm:ss.SSS");
+    }
+    const iso = date.toISOString();
+    return iso.slice(0, -1).replace("T", " ");
+  }
+  return format(date, "yyyy-MM-dd HH:mm:ss.SSS");
+}
+
+function extractTimestamp(item) {
+  if (!item || typeof item !== "object") return null;
+
+  const directCandidates = [
+    ["create_at", false],
+    ["createAt", false],
+    ["createdAt", false],
+    ["from_date", false],
+    ["timestamp", false],
+    ["to_date", false],
+    ["update_at", false],
+    ["updatedAt", false],
+    ["create_at_utc", true],
+    ["update_at_utc", true],
+    ["createAtUtc", true],
+    ["createdAtUtc", true],
+    ["updatedAtUtc", true],
+    ["updateAtUtc", true]
+  ];
+
+  for (const [key, treatAsUTC] of directCandidates) {
+    if (item[key] == null) continue;
+    const parsed = parseTimestamp(item[key], { treatAsUTC });
+    if (parsed) return parsed;
+  }
+
+  if (Array.isArray(item.media)) {
+    for (const media of item.media) {
+      const parsed = extractTimestamp(media);
+      if (parsed) return parsed;
+    }
+  }
+
+  return null;
+}
+
+function parseTimestamp(raw, { treatAsUTC = false } = {}) {
+  const str = String(raw).trim();
+  if (!str) return null;
+
+  const normalized = str.replace(" ", "T");
+  const attempts = new Set();
+
+  if (treatAsUTC) {
+    if (/[zZ]|[+-]\d{2}/.test(normalized)) {
+      attempts.add(normalized);
+    } else {
+      attempts.add(`${normalized}Z`);
+    }
+  } else {
+    attempts.add(str);
+    attempts.add(normalized);
+  }
+
+  for (const cand of attempts) {
+    const d = new Date(cand);
+    if (!Number.isNaN(d.getTime())) {
+      return { date: d, raw: str, treatAsUTC };
+    }
+  }
+
+  try {
+    const d = parseISO(normalized);
+    if (!Number.isNaN(d.getTime())) {
+      return { date: d, raw: str, treatAsUTC };
+    }
+  } catch {}
+
+  return null;
+}
+
 function pickRelevantApiHeaders(headers = {}) {
   const interesting = [
     "accept",
@@ -342,6 +427,13 @@ function buildApiHeaders({ storageState, savedHeaders }, { allowMissingUid = fal
     const tz = inferGroupField(storageState, "timezone");
     const offset = computeTimezoneOffsetHours(tz);
     base["x-lg-timezoneoffset"] = offset ?? String(-new Date().getTimezoneOffset() / 60);
+  }
+
+  if (base["x-lg-timezoneoffset"] != null) {
+    const num = Number(base["x-lg-timezoneoffset"]);
+    if (!Number.isNaN(num)) {
+      lastTimezoneOffsetHours = num;
+    }
   }
 
   if (!base["x-uid"]) {
@@ -435,10 +527,10 @@ async function createApiRequestContext({ storageState, savedHeaders }) {
   return pwRequest.newContext({ storageState, extraHTTPHeaders });
 }
 
-function buildNotesUrl({ enrollmentId, beforeISO, pageSize, noteCategory, videoBook, rawParams }) {
+function buildNotesUrl({ enrollmentId, beforeTime, pageSize, noteCategory, videoBook, rawParams }) {
   const u = new URL(NOTES_BASE);
-  // Matches the example: before_time=YYYY-MM-DD, count, enrollment_id, note_category, video_book
-  if (beforeISO) u.searchParams.set("before_time", beforeISO);
+  // Matches the example: before_time=YYYY-MM-DD HH:MM:SS.mmm, count, enrollment_id, note_category, video_book
+  if (beforeTime) u.searchParams.set("before_time", beforeTime);
   if (pageSize)  u.searchParams.set("count", String(pageSize));
   u.searchParams.set("enrollment_id", enrollmentId);
   if (noteCategory) u.searchParams.set("note_category", noteCategory);
@@ -451,48 +543,38 @@ function buildNotesUrl({ enrollmentId, beforeISO, pageSize, noteCategory, videoB
   return u.toString();
 }
 
-function getOldestTimestampISO(items) {
-  // Find oldest timestamp in a page; tolerate multiple field names.
-  const dates = [];
-  for (const it of items) {
-    const t = it.createAtUtc || it.createdAtUtc || it.createdAt || it.createAt || it.timestamp || it.updatedAtUtc;
-    if (!t) continue;
-    try {
-      const d = parseISO(String(t).replace(' ', 'T'));
-      if (!isNaN(d)) dates.push(d);
-    } catch {}
-  }
-  if (!dates.length) return null;
-  const oldest = dates.reduce((a, b) => (isBefore(a, b) ? a : b));
-  return oldest.toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
 function filterByRangeAndFindNext(items, startDate, endDate) {
-  if (!items?.length) return { kept: [], nextBefore: null };
+  if (!items?.length) return { kept: [], nextCursor: null };
 
-  // Keep only items within [startDate, endDate] if provided
-  const kept = items.filter(it => {
-    const raw = it.createAtUtc || it.createdAtUtc || it.createdAt || it.createAt || it.timestamp;
-    if (!raw) return true; // keep unknowns; your jq will skip if no timestamp
-    let d;
-    try { d = parseISO(String(raw).replace(' ', 'T')); } catch { return false; }
-    if (startDate && isBefore(d, startDate)) return false;
-    if (endDate && isAfter(d, addDays(endDate, 1))) return false;
-    return true;
-  });
+  const exclusiveEnd = endDate ? addDays(endDate, 1) : null;
+  const kept = [];
+  let oldest = null;
 
-  // For next page, we want `before_time = min(oldest_in_page, endDate+1)`
-  const pageOldestISO = getOldestTimestampISO(items);
-  if (!pageOldestISO) return { kept, nextBefore: null };
-
-  let nextBefore = pageOldestISO; // YYYY-MM-DD
-  if (startDate) {
-    const oldestDate = parseISO(pageOldestISO);
-    if (isBefore(oldestDate, startDate)) {
-      nextBefore = null; // we've gone past the start; stop
+  for (const it of items) {
+    const ts = extractTimestamp(it);
+    if (ts && (!oldest || isBefore(ts.date, oldest.date))) {
+      oldest = ts;
     }
+
+    if (!ts) {
+      kept.push(it);
+      continue;
+    }
+
+    const { date } = ts;
+    if (startDate && isBefore(date, startDate)) continue;
+    if (exclusiveEnd && !isBefore(date, exclusiveEnd)) continue;
+    kept.push(it);
   }
-  return { kept, nextBefore };
+
+  if (!oldest) return { kept, nextCursor: null };
+
+  const nextCursorMinus = subMilliseconds(oldest.date, 1);
+  if (startDate && !isAfter(nextCursorMinus, startDate)) {
+    return { kept, nextCursor: null };
+  }
+
+  return { kept, nextCursor: oldest };
 }
 
 async function robustGetJSON(request, url, tryNum = 0) {
@@ -525,26 +607,40 @@ async function fetchNotesRange({
 }) {
   const all = [];
 
-  // Start pagination from endDate+1 (or today+1) so the end day is fully included.
-  const today = new Date();
-  const initialUpper = addDays(endDate ?? today, 1);
-  let beforeISO = initialUpper.toISOString().slice(0, 10);
+  // Start pagination from endDate+1 (or tomorrow) at 00:00 so the end day is fully included.
+  const base = endDate ? new Date(endDate.getTime()) : new Date();
+  const initialUpper = addDays(base, 1);
+  initialUpper.setHours(0, 0, 0, 0);
+  let beforeCursor = formatForApi(initialUpper);
   let pages = 0;
 
   while (pages < maxPages) {
-    const url = buildNotesUrl({ enrollmentId, beforeISO, pageSize, noteCategory, videoBook, rawParams });
+    const url = buildNotesUrl({ enrollmentId, beforeTime: beforeCursor, pageSize, noteCategory, videoBook, rawParams });
     console.log(`Fetching page ${pages + 1} …`);
     console.log(`  → ${url}`);
     const json = await robustGetJSON(request, url);
-    const items = json?.items ?? json?.data ?? json ?? [];
+    let items = json?.items ?? json?.data ?? json ?? [];
+    if (!Array.isArray(items)) {
+      if (items && typeof items === "object") {
+        items = Object.values(items);
+      }
+    }
     if (!Array.isArray(items) || items.length === 0) break;
 
-    const { kept, nextBefore } = filterByRangeAndFindNext(items, startDate, endDate);
+    const { kept, nextCursor } = filterByRangeAndFindNext(items, startDate, endDate);
     all.push(...kept);
 
     pages += 1;
-    if (!nextBefore) break;
-    beforeISO = nextBefore;
+    if (!nextCursor) break;
+
+    let nextBefore = formatForApi(nextCursor.date, { treatAsUTC: nextCursor.treatAsUTC });
+    if (nextBefore === beforeCursor) {
+      const fallback = formatForApi(subMilliseconds(nextCursor.date, 1), { treatAsUTC: nextCursor.treatAsUTC });
+      if (fallback === beforeCursor) break;
+      nextBefore = fallback;
+    }
+
+    beforeCursor = nextBefore;
 
     await sleep(delayMs);
   }
@@ -553,7 +649,7 @@ async function fetchNotesRange({
   const seen = new Set();
   const deduped = [];
   for (const it of all) {
-    const id = it.id || it.noteId || JSON.stringify([it.createAtUtc, it.public_url, it.payload]);
+    const id = deriveStableId(it);
     if (!seen.has(id)) { seen.add(id); deduped.push(it); }
   }
   return deduped;
@@ -565,9 +661,11 @@ async function ensureAuthValid({ authPath, headless, username, password, enrollm
     try {
       const { storageState, savedHeaders } = loadAuthStateFile(authPath);
       const request = await createApiRequestContext({ storageState, savedHeaders });
+      const tomorrow = addDays(new Date(), 1);
+      tomorrow.setHours(0, 0, 0, 0);
       const testUrl = buildNotesUrl({
         enrollmentId,
-        beforeISO: addDays(new Date(), 1).toISOString().slice(0,10),
+        beforeTime: formatForApi(tomorrow),
         pageSize: 1,
         noteCategory: "report",
         videoBook: true,
@@ -588,4 +686,34 @@ async function ensureAuthValid({ authPath, headless, username, password, enrollm
     console.log("🔐 Logging in to refresh auth …");
     await loginAndSaveState({ username, password, authPath, headless });
   }
+}
+
+function deriveStableId(item) {
+  if (!item || typeof item !== "object") return JSON.stringify(item);
+
+  const direct = item.id
+    ?? item.id_str
+    ?? item.idStr
+    ?? item.noteId
+    ?? item.note_id
+    ?? item.local_id
+    ?? item.localId
+    ?? item.uid
+    ?? item.guid;
+  if (direct) return String(direct);
+
+  if (Array.isArray(item.media)) {
+    for (const media of item.media) {
+      if (media?.id) return String(media.id);
+      if (media?.mediaId) return String(media.mediaId);
+      if (media?.public_url) return `media:${media.public_url}`;
+    }
+  }
+
+  const ts = extractTimestamp(item)?.raw ?? "";
+  const payload = item.payload ?? item.originalPayload ?? item.description ?? "";
+  const mediaKey = Array.isArray(item.media)
+    ? item.media.map(m => m?.public_url ?? m?.id ?? "").join("|")
+    : "";
+  return `${ts}::${payload}::${mediaKey}`;
 }
