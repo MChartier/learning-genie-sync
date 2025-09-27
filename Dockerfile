@@ -30,6 +30,7 @@ VOLUME ["/data"]
 ENV NODE_ENV=production \
     OUTDIR=/data \
     OUTFILE=/tmp/input.json \
-    AUTH_PATH=/data/auth.storage.json
+    AUTH_PATH=/data/auth.storage.json \
+    STATE_PATH=/data/sync-state.json
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

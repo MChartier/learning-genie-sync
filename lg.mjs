@@ -37,6 +37,7 @@ const __dirname = path.dirname(__filename);
 
 const DEFAULT_AUTH = path.join(__dirname, "auth.storage.json");
 const DEFAULT_OUT  = path.join(process.cwd(), "input.json");
+const DEFAULT_STATE = process.env.STATE_PATH ?? path.join(process.cwd(), "sync-state.json");
 
 const LOGIN_URL  = "https://web.learning-genie.com/#/login";
 const PARENT_URL = "https://web.learning-genie.com/v2/#/parent";
@@ -50,11 +51,6 @@ const MAX_RETRIES = 4;
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
 
 let lastTimezoneOffsetHours = null;
-
-const MEDIA_EXTENSIONS = new Set([
-  "jpg", "jpeg", "heic", "png", "webp", "gif",
-  "mp4", "mov", "m4v", "avi", "mts"
-]);
 
 // -------------------- CLI definition --------------------
 
@@ -147,6 +143,7 @@ program.command("sync")
   .option("--video-book", "include video_book=true", true)
   .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
   .option("--outfile <file>", "intermediate JSON for your script", DEFAULT_OUT)
+  .option("--state <file>", "sync state JSON path", DEFAULT_STATE)
   .option("--outdir <dir>", "final download directory", path.join(process.cwd(), "downloads"))
   .option("--script <path>", "path to your bash script", "./learning-genie-download.sh")
   .option("--raw-params <queryString>", "extra query params")
@@ -169,6 +166,9 @@ program.command("sync")
     });
 
     // 2) Fetch date-range JSON
+    const statePath = opts.state;
+    const syncState = loadSyncState(statePath);
+
     const { storageState, savedHeaders } = loadAuthStateFile(opts.auth);
     let request;
     let headers;
@@ -211,6 +211,8 @@ program.command("sync")
       const usedFolderNames = new Map();
       const multi = targetEnrollments.length > 1;
 
+      let stateUpdated = false;
+
       for (const enrollment of targetEnrollments) {
         const enrollmentId = extractEnrollmentId(enrollment);
         if (!enrollmentId) {
@@ -227,12 +229,19 @@ program.command("sync")
           console.log(`🌐 [${displayName}] Using timezone ${timezone} for EXIF metadata`);
         }
 
-        const lastCaptured = findLatestCaptureTimestamp(childOutdir);
-        const derivedStart = lastCaptured ? addMilliseconds(lastCaptured, 1) : undefined;
+        const storedISO = syncState[enrollmentId];
+        let storedDate = null;
+        if (storedISO) {
+          try {
+            const parsed = parseISO(storedISO);
+            if (!Number.isNaN(parsed?.getTime?.())) storedDate = parsed;
+          } catch {}
+        }
+        const derivedStart = storedDate ? addMilliseconds(storedDate, 1) : undefined;
         const effectiveStart = selectEffectiveStartDate(startDate, derivedStart);
 
-        if (lastCaptured) {
-          console.log(`🕒 [${displayName}] Last captured at ${lastCaptured.toISOString()} (downloaded media)`);
+        if (storedDate) {
+          console.log(`🕒 [${displayName}] Last synced at ${storedDate.toISOString()} (state file)`);
         }
         if (effectiveStart) {
           const usingDerived = derivedStart && effectiveStart.getTime() === derivedStart.getTime();
@@ -275,10 +284,20 @@ program.command("sync")
           if (stdout) process.stdout.write(stdout);
           if (stderr) process.stderr.write(stderr);
           console.log(`✅ [${displayName}] Sync complete.`);
+
+          const latest = findLatestTimestamp(items);
+          if (latest) {
+            syncState[enrollmentId] = latest.toISOString();
+            stateUpdated = true;
+          }
         } catch (err) {
           console.error(`Downloader script failed for ${displayName}:`, err?.stderr || err?.message || err);
           process.exit(5);
         }
+      }
+
+      if (stateUpdated) {
+        saveSyncState(statePath, syncState);
       }
     } finally {
       await request.dispose();
@@ -915,30 +934,32 @@ function selectEffectiveStartDate(userStart, derivedStart) {
   return isAfter(userStart, derivedStart) ? userStart : derivedStart;
 }
 
-function findLatestCaptureTimestamp(dir) {
-  if (!dir) return null;
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return null;
-  }
+function findLatestTimestamp(items) {
+  if (!Array.isArray(items)) return null;
   let latest = null;
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const ext = entry.name.split(".").pop();
-    if (!ext || !MEDIA_EXTENSIONS.has(ext.toLowerCase())) continue;
-    const fullPath = path.join(dir, entry.name);
-    let stats;
-    try {
-      stats = fs.statSync(fullPath);
-    } catch {
-      continue;
-    }
-    const mtime = stats.mtime;
-    if (!latest || mtime > latest) {
-      latest = mtime;
+  for (const it of items) {
+    const ts = extractTimestamp(it);
+    if (ts && (!latest || isAfter(ts.date, latest))) {
+      latest = ts.date;
     }
   }
   return latest;
+}
+
+function loadSyncState(statePath) {
+  try {
+    const raw = fs.readFileSync(statePath, "utf8");
+    const data = JSON.parse(raw);
+    if (data && typeof data === "object") {
+      return data;
+    }
+  } catch {}
+  return {};
+}
+
+function saveSyncState(statePath, state) {
+  try {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  } catch {}
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 }

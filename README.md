@@ -10,7 +10,7 @@ It wraps Playwright to log in, pulls the Notes API for every enrolled child, and
   - `login`: interactive login to refresh auth storage.
   - `fetch`: download raw Notes JSON for a single enrollment/date range.
   - `sync`: multi-enrollment workflow that logs in if needed, fetches only new entries, and runs the downloader per child.
-- Incremental sync: scans the existing `downloads/<child>` folder and only requests Notes taken after the latest media timestamp.
+- Incremental sync: tracks the latest synced timestamp per enrollment in a state file so reruns only fetch new media.
 - Per-child timezone detection so downloaded media gets EXIF data in local time.
 - Docker container with Chromium/Playwright, `jq`, `supercronic`, and an optional cron schedule via `CRON_EXPRESSION`.
 
@@ -45,7 +45,7 @@ It wraps Playwright to log in, pulls the Notes API for every enrolled child, and
      --outdir ./downloads
    ```
 
-   - Omitting `--start/--end` will fetch “all history”, but subsequent runs will only pull new media (the CLI uses `downloads/<child>` timestamps to avoid duplicates).
+   - Omitting `--start/--end` will fetch “all history”, but subsequent runs will only pull new media (the CLI records the last-synced timestamp per child).
    - Add `--enrollment <GUID>` to limit to a specific child.
    - Output JSONs are written to `input.json` (or suffixed copies per child) before the downloader runs.
 
@@ -113,6 +113,7 @@ Example above runs at 6 pm every weekday.
 | `OUTDIR`        | No       | `/data`                      | Root directory for downloads (maps to host volume) |
 | `OUTFILE`       | No       | `/tmp/input.json`            | Base JSON output file per sync |
 | `AUTH_PATH`     | No       | `/data/auth.storage.json`    | Storage state path |
+| `STATE_PATH`    | No       | `/data/sync-state.json`      | Persistent per-enrollment watermark store |
 | `LOCAL_TZ`      | No       | *(Derived per child)*        | Override timezone for downloader (rarely needed) |
 
 ## Development Tips

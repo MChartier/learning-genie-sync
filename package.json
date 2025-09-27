@@ -1,5 +1,5 @@
 {
-  "name": "learning-genie-cli",
+  "name": "learning-genie-sync",
   "version": "0.1.1",
   "type": "module",
   "private": true,
@@ -11,6 +11,7 @@
   "scripts": {
     "login": "node ./lg.mjs login",
     "fetch": "node ./lg.mjs fetch",
-    "sync":  "node ./lg.mjs sync"
+    "sync":  "node ./lg.mjs sync",
+    "docker-build": "docker build -t learning-genie-sync ."
   }
 }
