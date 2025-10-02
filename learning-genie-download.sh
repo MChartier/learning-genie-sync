@@ -23,7 +23,7 @@ mkdir -p "$OUTDIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-MAP="$TMP_DIR/map.tsv"  # <url>\t<utc>
+MAP="$TMP_DIR/map.tsv"  # <url>\t<timestamp>\t<tz_hint>\t<caption>
 URLS="$TMP_DIR/urls.txt"
 
 echo "1) Extracting URLs, timestamps, and captions from $JSON …"
@@ -34,9 +34,38 @@ jq -r '
   | . as $parent
   | .media[]
   | select(.public_url != null)
+  | ( {
+        utc: ([
+          .createAtUtc,
+          .createdAtUtc,
+          .create_at_utc,
+          .created_at_utc,
+          .createAtUTC,
+          .createdAtUTC,
+          $parent.createAtUtc,
+          $parent.createdAtUtc,
+          $parent.create_at_utc,
+          $parent.created_at_utc,
+          $parent.createAtUTC,
+          $parent.createdAtUTC
+        ] | map(select(. != null and . != "")) | .[0]),
+        local: ([
+          .createAt,
+          .createdAt,
+          .create_at,
+          .created_at,
+          $parent.createAt,
+          $parent.createdAt,
+          $parent.create_at,
+          $parent.created_at
+        ] | map(select(. != null and . != "")) | .[0])
+      } ) as $ts
+  | ($ts.utc // $ts.local) as $value
+  | select($value != null)
   | [
       .public_url,
-      (.createAtUtc // .createdAtUtc // .createdAt // .createAt),
+      ($value | tostring),
+      (if $ts.utc != null then "utc" else "local" end),
       (if ($parent.type // "") == "Activity"
          then ($parent.payload // ""
                | tostring
@@ -48,7 +77,6 @@ jq -r '
          else ""
        end)
     ]
-  | select(.[1] != null)
   | @tsv
 ' "$JSON" > "$MAP"
 
@@ -86,33 +114,60 @@ find_downloaded_path() {
   return 1
 }
 
-# sanitize an incoming UTC string (may have T or milliseconds)
-sanitize_utc() {
-  # $1 raw utc like "2025-09-17 22:33:30" or "2025-09-17T22:33:30.000"
+normalize_timestamp() {
+  # $1 raw timestamp like "2025-09-17T22:33:30.000Z" or "2025-09-17 15:33:30"
   local s="$1"
   s="${s/T/ }"
-  s="${s%%.*}"
-  echo "${s:0:19}"
+
+  # Strip fractional seconds while preserving any timezone suffix (Z or ±HH[:MM])
+  if [[ "$s" =~ ^(.*)\.([0-9]+)(Z|[+-][0-9:]+)?$ ]]; then
+    local main="${BASH_REMATCH[1]}"
+    local tz="${BASH_REMATCH[3]}"
+    s="$main$tz"
+  fi
+
+  # Trim trailing whitespace introduced by replacements (if any)
+  while [[ "$s" == *" " ]]; do
+    s="${s% }"
+  done
+
+  echo "$s"
 }
 
-# convert "YYYY-MM-DD HH:MM:SS" (UTC) -> local variants
-# outputs 4 globals: EXIF_TS, XMP_TS, IPTC_DATE, IPTC_TIME, and FILE_TS (ISO with offset)
-to_local() {
-  local utc="$1"
-  local epoch
-  epoch=$(date -ud "$utc" +%s)  # interpret input as UTC
-  EXIF_TS=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%Y:%m:%d %H:%M:%S')      # local, no TZ
-  XMP_TS=$(TZ="$LOCAL_TZ"  date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%:z')   # local ISO, with offset
-  IPTC_DATE=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%Y:%m:%d')             # local date
-  IPTC_TIME=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%H:%M:%S%:z')          # local time with offset
-  FILE_TS="$XMP_TS"                                                      # use ISO (with offset) for FileModifyDate
+# Convert an incoming timestamp into local-time metadata fields.
+# Sets globals: EXIF_TS, XMP_TS, IPTC_DATE, IPTC_TIME, FILE_TS, and LOG_TS.
+prepare_timestamp() {
+  # $1 raw timestamp, $2 hint ("utc" or "local")
+  local raw="$1"; local hint="$2"
+  local normalized epoch
+
+  normalized="$(normalize_timestamp "$raw")" || return 1
+
+  if [[ "$hint" == "utc" ]]; then
+    if ! epoch=$(date -ud "$normalized" +%s 2>/dev/null); then
+      return 1
+    fi
+  else
+    if ! epoch=$(TZ="$LOCAL_TZ" date -d "$normalized" +%s 2>/dev/null); then
+      return 1
+    fi
+  fi
+
+  EXIF_TS=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%Y:%m:%d %H:%M:%S')
+  XMP_TS=$(TZ="$LOCAL_TZ"  date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%:z')
+  IPTC_DATE=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%Y:%m:%d')
+  IPTC_TIME=$(TZ="$LOCAL_TZ" date -d "@$epoch" '+%H:%M:%S%:z')
+  FILE_TS="$XMP_TS"
+  LOG_TS="$XMP_TS"
 }
 
 stamp_image() {
-  # $1 = file path, $2 = raw utc, $3 = caption (optional)
-  local f="$1"; local raw="$2"; local caption="${3-}"
-  local utc; utc="$(sanitize_utc "$raw")"
-  to_local "$utc"
+  # $1 = file path, $2 = raw timestamp, $3 = hint (utc/local), $4 = caption (optional)
+  local f="$1"; local raw="$2"; local hint="$3"; local caption="${4-}"
+  if ! prepare_timestamp "$raw" "$hint"; then
+    echo "   ⚠ Failed to parse timestamp '$raw' (hint=$hint) for $(basename "$f")" >&2
+    return
+  fi
   local ext="${f##*.}"; ext="${ext,,}"
 
   local -a still_caption_args=()
@@ -142,7 +197,7 @@ stamp_image() {
       "-FileModifyDate=$FILE_TS"
     )
     exiftool "${args[@]}" "${still_caption_args[@]}" "${xmp_caption_args[@]}" "$f" >/dev/null
-    echo "   🖼  EXIF/XMP/IPTC set (LOCAL) → $(basename "$f") ← $XMP_TS"
+    echo "   🖼  EXIF/XMP/IPTC set (LOCAL) → $(basename "$f") ← $LOG_TS"
 
   elif [[ "$ext" =~ ^(png|webp)$ ]]; then
     # embed XMP + create sidecar; set mtime
@@ -170,7 +225,7 @@ stamp_image() {
       "-XMP-photoshop:DateCreated=$XMP_TS"
     )
     exiftool "${sidecar_args[@]}" "${xmp_caption_args[@]}" "$f" >/dev/null
-    echo "   🧩 PNG/WEBP XMP+sidecar (LOCAL) → $(basename "$f") ← $XMP_TS"
+    echo "   🧩 PNG/WEBP XMP+sidecar (LOCAL) → $(basename "$f") ← $LOG_TS"
 
   else
     # Unknown still image: sidecar + mtime
@@ -194,15 +249,17 @@ stamp_image() {
       "-FileModifyDate=$FILE_TS"
     )
     exiftool "${mtime_args[@]}" "$f" >/dev/null
-    echo "   ℹ  Sidecar+mtime (LOCAL) → $(basename "$f") ← $XMP_TS"
+    echo "   ℹ  Sidecar+mtime (LOCAL) → $(basename "$f") ← $LOG_TS"
   fi
 }
 
 stamp_video() {
-  # $1 = file path, $2 = raw utc, $3 = caption (optional)
-  local f="$1"; local raw="$2"; local caption="${3-}"
-  local utc; utc="$(sanitize_utc "$raw")"
-  to_local "$utc"
+  # $1 = file path, $2 = raw timestamp, $3 = hint (utc/local), $4 = caption (optional)
+  local f="$1"; local raw="$2"; local hint="$3"; local caption="${4-}"
+  if ! prepare_timestamp "$raw" "$hint"; then
+    echo "   ⚠ Failed to parse timestamp '$raw' (hint=$hint) for $(basename "$f")" >&2
+    return
+  fi
   local -a caption_args=()
   if [[ -n "$caption" ]]; then
     caption_args=(
@@ -221,11 +278,12 @@ stamp_video() {
     "-FileModifyDate=$FILE_TS"
   )
   exiftool "${args[@]}" "${caption_args[@]}" "$f" >/dev/null
-  echo "   🎬 QuickTime/XMP set (LOCAL) → $(basename "$f") ← $EXIF_TS"
+  echo "   🎬 QuickTime/XMP set (LOCAL) → $(basename "$f") ← $LOG_TS"
 }
 
 echo "3) Embedding LOCAL capture dates (TZ=$LOCAL_TZ) with exiftool …"
-while IFS=$'\t' read -r url utc caption; do
+while IFS=$'\t' read -r url raw hint caption; do
+  hint="${hint:-utc}"
   base="$(basename "${url%%\?*}")"
   file=""
   if file=$(find_downloaded_path "$base"); then :; else
@@ -235,9 +293,9 @@ while IFS=$'\t' read -r url utc caption; do
 
   ext="${file##*.}"; ext="${ext,,}"
   if [[ "$ext" =~ ^(mp4|mov|m4v)$ ]]; then
-    stamp_video "$file" "$utc" "$caption"
+    stamp_video "$file" "$raw" "$hint" "$caption"
   else
-    stamp_image "$file" "$utc" "$caption"
+    stamp_image "$file" "$raw" "$hint" "$caption"
   fi
 done < "$MAP"
 

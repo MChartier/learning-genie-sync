@@ -1,5 +1,7 @@
 data/
+downloads/
 node_modules/
 response.json
 auth.storage.json
 input.json
+sync-state.json

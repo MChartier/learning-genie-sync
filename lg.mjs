@@ -347,7 +347,7 @@ async function loginAndSaveState({ username, password, authPath, headless }) {
   console.log(`🔐 Navigating to login page …`);
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-  console.log(`🔐 Filling login form and submitting …`);
+  console.log(`✏️ Filling login form and submitting …`);
   const emailField = page.locator('input[id="userEmail"]');
   const passwordField = page.locator('input[id="userPassword"]');
   await emailField.waitFor({ state: "visible", timeout: 15000 });
@@ -359,12 +359,12 @@ async function loginAndSaveState({ username, password, authPath, headless }) {
     page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 }).catch(() => {})
   ]);
 
-  console.log(`🔐 Waiting for parent portal to load …`);
+  console.log(`👶 Waiting for parent portal to load …`);
   await page.goto(PARENT_URL, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
-  console.log(`🔐 Saving auth state …`);
+  console.log(`🔑 Saving auth state …`);
   const storage = await ctx.storageState();
   const extraHeaders = buildApiHeaders({
     storageState: storage,
@@ -378,7 +378,7 @@ async function loginAndSaveState({ username, password, authPath, headless }) {
     : storage;
   fs.writeFileSync(authPath, JSON.stringify(payload, null, 2));
 
-  console.log("🔐 Login complete.");
+  console.log("💯 Login complete.");
   await browser.close();
 }
 
