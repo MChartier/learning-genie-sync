@@ -274,7 +274,14 @@ stamp_video() {
     -overwrite_original
     "-QuickTime:CreateDate=$EXIF_TS"
     "-QuickTime:ModifyDate=$EXIF_TS"
+    "-QuickTime:TrackCreateDate=$EXIF_TS"
+    "-QuickTime:TrackModifyDate=$EXIF_TS"
+    "-QuickTime:MediaCreateDate=$EXIF_TS"
+    "-QuickTime:MediaModifyDate=$EXIF_TS"
     "-XMP:xmp:CreateDate=$XMP_TS"
+    "-XMP:xmp:ModifyDate=$XMP_TS"
+    "-XMP:xmp:MetadataDate=$XMP_TS"
+    "-XMP-photoshop:DateCreated=$XMP_TS"
     "-FileModifyDate=$FILE_TS"
   )
   exiftool "${args[@]}" "${caption_args[@]}" "$f" >/dev/null
