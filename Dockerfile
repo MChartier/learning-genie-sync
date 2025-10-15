@@ -9,7 +9,7 @@ RUN curl -fsSLo /usr/local/bin/supercronic \
       https://github.com/aptible/supercronic/releases/download/v0.2.30/supercronic-linux-amd64 \
     && chmod +x /usr/local/bin/supercronic \
     && apt-get update \
-    && apt-get install -y --no-install-recommends jq aria2 exiftool\
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq aria2 exiftool tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package manifests and install deps first for better caching
