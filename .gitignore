@@ -5,3 +5,4 @@ response.json
 auth.storage.json
 input.json
 sync-state.json
+dist/

@@ -4,21 +4,22 @@ FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 # Set working directory
 WORKDIR /app
 
-# Install supercronic for cron scheduling and jq for downloader script
+# Install supercronic for cron scheduling
 RUN curl -fsSLo /usr/local/bin/supercronic \
       https://github.com/aptible/supercronic/releases/download/v0.2.30/supercronic-linux-amd64 \
     && chmod +x /usr/local/bin/supercronic \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq aria2 exiftool tzdata \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package manifests and install deps first for better caching
-COPY package*.json ./
-RUN npm install --omit=dev
+COPY package*.json tsconfig.json ./
+COPY src ./src
+RUN npm install \
+    && npm run build \
+    && npm prune --omit=dev
 
 # Copy application code
-COPY lg.mjs ./
-COPY learning-genie-download.sh ./
 COPY docker ./docker
 
 # Ensure scripts are executable

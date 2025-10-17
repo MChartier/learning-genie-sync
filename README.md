@@ -1,15 +1,16 @@
 # Learning Genie Sync CLI
 
 This project automates downloading photos/videos for parent accounts on [Learning Genie](https://www.learning-genie.com/).
-It wraps Playwright to log in, pulls the Notes API for every enrolled child, and runs a bash downloader that saves the media with local EXIF timestamps.
+It uses Playwright to authenticate, fetches new Notes for every enrolled child, and downloads each media item while stamping local EXIF/XMP metadata directly from a TypeScript CLI.
 
 ## Features
 
 - Playwright-based login that captures persistent storage state and required headers (`X-UID`, timezone, etc.); the sync command refreshes auth automatically as needed.
-- Single `sync` command that logs in (if required), fetches new entries for every enrolled child, and runs the downloader per child.
+- Single `sync` command that logs in (if required), fetches new entries for every enrolled child, downloads media, and applies metadata in one pass.
 - Incremental sync: tracks the latest synced timestamp per enrollment in a state file so reruns only fetch new media.
 - Per-child timezone detection so downloaded media gets EXIF data in local time.
-- Docker container with Chromium/Playwright, `jq`, `supercronic`, and an optional cron schedule via `CRON_EXPRESSION`.
+- Pure Node.js downloader—no external `jq`, `aria2c`, or system `exiftool` required (the CLI uses `exiftool-vendored`).
+- Docker container with Chromium/Playwright, the compiled CLI, `supercronic`, and an optional cron schedule via `CRON_EXPRESSION`.
 
 ## Prerequisites (local)
 
@@ -20,7 +21,7 @@ It wraps Playwright to log in, pulls the Notes API for every enrolled child, and
   npx playwright install
   sudo npx playwright install-deps
   ```
-- Runtime dependencies used by the downloader: `jq`, `aria2c`, `exiftool`, `date` (typically preinstalled on most Linux distributions).
+- No additional CLI tools are required for downloads or metadata stamping.
 
 ## Setup (local)
 
@@ -28,23 +29,24 @@ It wraps Playwright to log in, pulls the Notes API for every enrolled child, and
  ```bash
   npm install
   ```
-2. Run a sync (the command logs in automatically when `LG_USER`/`LG_PASS` are provided):
+2. (Optional) Build the compiled CLI:
+   ```bash
+   npm run build
+   ```
+   This produces `dist/cli.js`, which is what the Docker image runs. The `npm run sync` script uses `tsx`, so building is optional for local development.
+3. Run a sync (the command logs in automatically when `LG_USER`/`LG_PASS` are provided):
    ```bash
    LG_USER="you@example.com" LG_PASS="secret" \
-   node ./lg.mjs sync \
+   npm run sync -- \
      --outdir ./downloads
    ```
    - `--auth`, `--outfile`, and `--outdir` are optional; defaults are `./auth.storage.json`, `./input.json`, and `./downloads`.
    - Subsequent runs fetch only newly posted media. Delete the file at `STATE_PATH` (defaults to `./sync-state.json`) to force a full rescan.
-
-3. Run the downloader script directly (if needed):
-   ```bash
-   ./learning-genie-download.sh input.json ./downloads
-   ```
+   - After running `npm run build` you can execute the compiled CLI directly with `node dist/cli.js sync ...`.
 
 ## Docker Usage
 
-The project ships with a Dockerfile based on `mcr.microsoft.com/playwright:v1.55.1-jammy` and installs everything needed (Chromium, dependencies, `jq`, `supercronic`).
+The project ships with a Dockerfile based on `mcr.microsoft.com/playwright:v1.55.1-jammy` and installs everything needed (Chromium, dependencies, the compiled CLI, `supercronic`).
 
 ### Build
 
@@ -96,9 +98,10 @@ Example above runs at 6 pm every weekday.
 
 ## Development Tips
 
-- `npm run sync` (after setting `LG_USER`/`LG_PASS`) → convenience wrapper around `node lg.mjs sync`.
+- `npm run sync` (after setting `LG_USER`/`LG_PASS`) runs the TypeScript CLI directly via `tsx`.
+- `npm run build` emits the compiled `dist/cli.js` that Docker uses.
 - Delete `auth.storage.json` (or the file pointed at by `AUTH_PATH`) if you need to force a fresh login; the next sync will recreate it when credentials are supplied.
-- The downloader expects `jq`, `aria2c`, and `exiftool`; the Docker image ships with these, but on bare metal you may need to install them.
+- The downloader ships with a vendored ExifTool binary—no extra system packages required.
 
 ## Known Limitations
 

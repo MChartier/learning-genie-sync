@@ -1,15 +1,24 @@
 {
   "name": "learning-genie-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "private": true,
   "dependencies": {
     "commander": "^12.1.0",
     "date-fns": "^4.1.0",
+    "exiftool-vendored": "^26.0.0",
+    "luxon": "^3.4.4",
+    "p-limit": "^5.0.0",
     "playwright": "^1.55.1"
   },
   "scripts": {
-    "sync":  "node ./lg.mjs sync",
+    "build": "tsc",
+    "sync": "tsx src/cli.ts sync",
     "docker-build": "docker build -t learning-genie-sync ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.6.3"
   }
 }

@@ -11,6 +11,6 @@ OUTDIR=${OUTDIR:-/data}
 mkdir -p "$(dirname "$AUTH_PATH")"
 mkdir -p "$OUTDIR"
 
-CMD=(node /app/lg.mjs sync --auth "$AUTH_PATH" --outfile "$OUTFILE" --outdir "$OUTDIR")
+CMD=(node /app/dist/cli.js sync --auth "$AUTH_PATH" --outfile "$OUTFILE" --outdir "$OUTDIR")
 
 exec "${CMD[@]}"
