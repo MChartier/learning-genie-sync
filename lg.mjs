@@ -1,22 +1,13 @@
 #!/usr/bin/env node
 /**
- * Learning Genie CLI (Playwright)
- * - login: interactive login; saves auth state (cookies/storage)
- * - fetch: fetch Notes JSON for a date range
- * - sync:  ensure auth → fetch JSON → run your bash downloader (one command)
+ * Learning Genie Sync CLI (Playwright)
+ * - sync: ensure auth → fetch new Notes → run the downloader per child
  *
  * Typical usage:
- *   # First run (one-liner):
  *   LG_USER="you@example.com" LG_PASS="secret" \
- *   node ./lg.mjs sync --enrollment D1435731-662B-42A2-97C6-5D039BB087BC \
- *                      --start 2025-09-01 --end 2025-09-27 \
- *                      --outdir downloads \
- *                      --script ./learning-genie-download.sh
- *
- *   # Or split:
- *   LG_USER=... LG_PASS=... node ./lg.mjs login --headful
- *   node ./lg.mjs fetch --enrollment ... --start ... --end ... --out response.json
- *   ./learning-genie-download.sh response.json downloads
+ *   node ./lg.mjs sync --auth /data/auth.storage.json \
+ *                      --outfile /tmp/input.json \
+ *                      --outdir /data
  */
 
 import { Command } from "commander";
@@ -37,7 +28,9 @@ const __dirname = path.dirname(__filename);
 
 const DEFAULT_AUTH = path.join(__dirname, "auth.storage.json");
 const DEFAULT_OUT  = path.join(process.cwd(), "input.json");
+const DEFAULT_OUTDIR = process.env.OUTDIR ?? path.join(process.cwd(), "downloads");
 const DEFAULT_STATE = process.env.STATE_PATH ?? path.join(process.cwd(), "sync-state.json");
+const DOWNLOADER_SCRIPT = path.join(__dirname, "learning-genie-download.sh");
 
 const LOGIN_URL  = "https://web.learning-genie.com/#/login";
 const PARENT_URL = "https://web.learning-genie.com/v2/#/parent";
@@ -47,6 +40,9 @@ const ENROLLMENTS_URL = "https://api2.learning-genie.com/api/v1/Enrollments";
 // polite defaults
 const DEFAULT_COUNT = 50;
 const DEFAULT_DELAY_MS = 350; // between API calls
+const DEFAULT_NOTE_CATEGORY = "report";
+const INCLUDE_VIDEO_BOOK = true;
+const MAX_SYNC_PAGES = 200;
 const MAX_RETRIES = 4;
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
 
@@ -57,119 +53,33 @@ let lastTimezoneOffsetHours = null;
 const program = new Command();
 program
   .name("lg")
-  .description("Learning Genie CLI: login + fetch Notes (and optional one-shot sync)")
-  .version("0.1.1");
+  .description("Learning Genie Sync CLI")
+  .version("0.2.0");
 
-// ----- login -----
-program.command("login")
-  .description("Interactive login and save storage state")
-  .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
-  .option("--headful", "show the browser window", false)
-  .option("--username <email>", "username; defaults LG_USER env")
-  .option("--password <pass>", "password; defaults LG_PASS env")
-  .action(async (opts) => {
-    const username = opts.username ?? process.env.LG_USER;
-    const password = opts.password ?? process.env.LG_PASS;
-    if (!username || !password) {
-      console.error("LG_USER and LG_PASS env (or --username/--password) required.");
-      console.error("Got: username=", username, " password=", password);
-      process.exit(2);
-    }
-    await loginAndSaveState({ username, password, authPath: opts.auth, headless: !opts.headful });
-    console.log(`Saved auth → ${opts.auth}`);
-  });
-
-// ----- fetch -----
-program.command("fetch")
-  .description("Fetch Notes JSON for a date range")
-  .requiredOption("--enrollment <id>", "enrollment_id (GUID)")
-  .option("--start <YYYY-MM-DD>", "start date (inclusive)")
-  .option("--end <YYYY-MM-DD>", "end date (inclusive)")
-  .option("--count <n>", "page size for Notes?count=", `${DEFAULT_COUNT}`)
-  .option("--note-category <name>", "note_category filter", "report")
-  .option("--video-book", "include video_book=true", true)
-  .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
-  .option("--out <file>", "output JSON file", DEFAULT_OUT)
-  .option("--raw-params <queryString>", "append raw query params, e.g. 'foo=bar&baz=1'")
-  .option("--max-pages <n>", "safety cap on pages", "200")
-  .option("--delay <ms>", "delay between page requests", `${DEFAULT_DELAY_MS}`)
-  .action(async (opts) => {
-    const { enrollment, start, end, count, noteCategory, videoBook, auth, out, rawParams } = normalizeFetchOptions(opts);
-
-    if (!fs.existsSync(auth)) {
-      console.error(`Auth state not found at ${auth}. Run: lg login`);
-      process.exit(3);
-    }
-    const { storageState, savedHeaders } = loadAuthStateFile(auth);
-    let request;
-    try {
-      ({ request } = await createApiRequestContext({ storageState, savedHeaders }));
-    } catch (err) {
-      console.error(err?.message || err);
-      process.exit(4);
-    }
-
-    try {
-      const all = await fetchNotesRange({
-        request,
-        enrollmentId: enrollment,
-        startDate: start,
-        endDate: end,
-        pageSize: count,
-        noteCategory,
-        videoBook,
-        rawParams,
-        maxPages: Number(opts.maxPages),
-        delayMs: Number(opts.delay)
-      });
-
-      // Write a shape your jq already handles (root has "items")
-      const payload = { items: all };
-      fs.writeFileSync(out, JSON.stringify(payload, null, 2));
-      console.log(`Wrote ${all.length} items → ${out}`);
-    } finally {
-      await request.dispose();
-    }
-  });
-
-// ----- sync (one-shot) -----
+// ----- sync (primary workflow) -----
 program.command("sync")
-  .description("Login if needed → fetch Notes → run your bash downloader in one go")
-  .option("--enrollment <id>", "limit to a specific enrollment_id (GUID)")
-  .option("--start <YYYY-MM-DD>", "start date (inclusive)")
-  .option("--end <YYYY-MM-DD>", "end date (inclusive)")
-  .option("--count <n>", "page size", `${DEFAULT_COUNT}`)
-  .option("--note-category <name>", "note_category filter", "report")
-  .option("--video-book", "include video_book=true", true)
+  .description("Login if needed → fetch new Notes → run the downloader per child")
   .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
-  .option("--outfile <file>", "intermediate JSON for your script", DEFAULT_OUT)
-  .option("--state <file>", "sync state JSON path", DEFAULT_STATE)
-  .option("--outdir <dir>", "final download directory", path.join(process.cwd(), "downloads"))
-  .option("--script <path>", "path to your bash script", "./learning-genie-download.sh")
-  .option("--raw-params <queryString>", "extra query params")
-  .option("--headful", "show browser UI for login/captcha", false)
+  .option("--outfile <file>", "intermediate JSON for the downloader", DEFAULT_OUT)
+  .option("--outdir <dir>", "final download directory", DEFAULT_OUTDIR)
   .action(async (opts) => {
+    const authPath = opts.auth ?? DEFAULT_AUTH;
+    const outfileBase = opts.outfile ?? DEFAULT_OUT;
+    const outdirRoot = opts.outdir ?? DEFAULT_OUTDIR;
+
     const username = process.env.LG_USER;
     const password = process.env.LG_PASS;
-    if (!fs.existsSync(opts.auth) && (!username || !password)) {
-      console.error("First run needs creds: set LG_USER and LG_PASS env (or run `lg login`).");
+    if (!fs.existsSync(authPath) && (!username || !password)) {
+      console.error("First run needs LG_USER and LG_PASS so the sync can log in automatically.");
       process.exit(2);
     }
 
-    // 1) Ensure we have valid auth (try a small API call; if 401 → login)
-    await ensureAuthValid({
-      authPath: opts.auth,
-      headless: !opts.headful,
-      username,
-      password,
-      enrollmentId: opts.enrollment
-    });
+    await ensureAuthValid({ authPath, username, password });
 
-    // 2) Fetch date-range JSON
-    const statePath = opts.state;
+    const statePath = DEFAULT_STATE;
     const syncState = loadSyncState(statePath);
 
-    const { storageState, savedHeaders } = loadAuthStateFile(opts.auth);
+    const { storageState, savedHeaders } = loadAuthStateFile(authPath);
     let request;
     let headers;
     try {
@@ -178,14 +88,8 @@ program.command("sync")
       console.error(err?.message || err);
       process.exit(4);
     }
-    try {
-      const startDate = opts.start ? parseISO(opts.start) : undefined;
-      const endDate   = opts.end   ? parseISO(opts.end)   : undefined;
-      const pageSize = Number(opts.count ?? DEFAULT_COUNT);
-      const noteCategory = opts.noteCategory ?? "report";
-      const videoBook = opts.videoBook !== false;
-      const rawParams = opts.rawParams ?? "";
 
+    try {
       let enrollments;
       try {
         enrollments = await fetchParentEnrollments({ request, headers });
@@ -199,21 +103,11 @@ program.command("sync")
         process.exit(7);
       }
 
-      let targetEnrollments = enrollments;
-      if (opts.enrollment) {
-        targetEnrollments = enrollments.filter(e => extractEnrollmentId(e) === opts.enrollment);
-        if (targetEnrollments.length === 0) {
-          console.error(`Enrollment ${opts.enrollment} not found for this parent.`);
-          process.exit(8);
-        }
-      }
-
       const usedFolderNames = new Map();
-      const multi = targetEnrollments.length > 1;
-
+      const multi = enrollments.length > 1;
       let stateUpdated = false;
 
-      for (const enrollment of targetEnrollments) {
+      for (const enrollment of enrollments) {
         const enrollmentId = extractEnrollmentId(enrollment);
         if (!enrollmentId) {
           console.warn("Skipping enrollment with missing id:", JSON.stringify(enrollment));
@@ -222,7 +116,7 @@ program.command("sync")
 
         const displayName = resolveEnrollmentDisplayName(enrollment, enrollmentId);
         const folderBase = uniqueSlug(displayName, usedFolderNames);
-        const childOutdir = path.join(opts.outdir, folderBase);
+        const childOutdir = path.join(outdirRoot, folderBase);
 
         const timezone = resolveEnrollmentTimezone({ enrollment, headers });
         if (timezone) {
@@ -238,14 +132,14 @@ program.command("sync")
           } catch {}
         }
         const derivedStart = storedDate ? addMilliseconds(storedDate, 1) : undefined;
-        const effectiveStart = selectEffectiveStartDate(startDate, derivedStart);
+        const effectiveStart = selectEffectiveStartDate(undefined, derivedStart);
 
         if (storedDate) {
           console.log(`🕒 [${displayName}] Last synced at ${storedDate.toISOString()} (state file)`);
         }
         if (effectiveStart) {
           const usingDerived = derivedStart && effectiveStart.getTime() === derivedStart.getTime();
-          const sourceLabel = usingDerived ? "derived" : (startDate ? "user" : "default");
+          const sourceLabel = usingDerived ? "derived" : "default";
           console.log(`📆 [${displayName}] Using start time ${effectiveStart.toISOString()} (${sourceLabel})`);
         }
 
@@ -254,16 +148,13 @@ program.command("sync")
           request,
           enrollmentId,
           startDate: effectiveStart,
-          endDate,
-          pageSize,
-          noteCategory,
-          videoBook,
-          rawParams,
-          maxPages: 200,
+          endDate: undefined,
+          pageSize: DEFAULT_COUNT,
+          maxPages: MAX_SYNC_PAGES,
           delayMs: DEFAULT_DELAY_MS
         });
 
-        const outfile = multi ? appendFileSuffix(opts.outfile, `-${folderBase}`) : opts.outfile;
+        const outfile = multi ? appendFileSuffix(outfileBase, `-${folderBase}`) : outfileBase;
 
         fs.writeFileSync(outfile, JSON.stringify({ items }, null, 2));
         console.log(`📄 [${displayName}] Wrote ${items.length} items → ${outfile}`);
@@ -274,11 +165,11 @@ program.command("sync")
         }
 
         await fs.promises.mkdir(childOutdir, { recursive: true }).catch(() => {});
-        console.log(`⬇️  [${displayName}] Running: ${opts.script} "${outfile}" "${childOutdir}"`);
+        console.log(`⬇️  [${displayName}] Running: ${DOWNLOADER_SCRIPT} "${outfile}" "${childOutdir}"`);
         try {
           const env = { ...process.env };
           if (timezone) env.LOCAL_TZ = timezone;
-          const { stdout, stderr } = await execFile(opts.script, [outfile, childOutdir], {
+          const { stdout, stderr } = await execFile(DOWNLOADER_SCRIPT, [outfile, childOutdir], {
             env
           });
           if (stdout) process.stdout.write(stdout);
@@ -308,27 +199,7 @@ program.parseAsync(process.argv);
 
 // -------------------- helpers --------------------
 
-function normalizeFetchOptions(opts) {
-  const start = opts.start ? parseISO(opts.start) : undefined;
-  const end   = opts.end   ? parseISO(opts.end)   : undefined;
-  if (start && end && isAfter(start, addDays(end, 1))) {
-    console.error("Invalid range: start must be <= end");
-    process.exit(4);
-  }
-  return {
-    enrollment: opts.enrollment,
-    start,
-    end,
-    count: Number(opts.count ?? DEFAULT_COUNT),
-    noteCategory: opts.noteCategory ?? "report",
-    videoBook: opts.videoBook !== false, // default true
-    auth: opts.auth ?? DEFAULT_AUTH,
-    out: opts.out ?? DEFAULT_OUT,
-    rawParams: opts.rawParams ?? ""
-  };
-}
-
-async function loginAndSaveState({ username, password, authPath, headless }) {
+async function loginAndSaveState({ username, password, authPath, headless = true }) {
   const browser = await chromium.launch({ headless });
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -550,7 +421,7 @@ function buildApiHeaders({ storageState, savedHeaders }, { allowMissingUid = fal
   }
 
   if (!cleaned["x-uid"] && !allowMissingUid) {
-    throw new Error("Missing X-UID header. Rerun `lg login --headful` and ensure the portal loads (or set LG_UID env).");
+    throw new Error("Missing X-UID header. Re-run the sync with LG_USER/LG_PASS set or provide LG_UID env.");
   }
 
   return cleaned;
@@ -626,18 +497,15 @@ async function createApiRequestContext({ storageState, savedHeaders }) {
   return { request, extraHTTPHeaders };
 }
 
-function buildNotesUrl({ enrollmentId, beforeTime, pageSize, noteCategory, videoBook, rawParams }) {
+function buildNotesUrl({ enrollmentId, beforeTime, pageSize }) {
   const u = new URL(NOTES_BASE);
   // Matches the example: before_time=YYYY-MM-DD HH:MM:SS.mmm, count, enrollment_id, note_category, video_book
   if (beforeTime) u.searchParams.set("before_time", beforeTime);
   if (pageSize)  u.searchParams.set("count", String(pageSize));
   u.searchParams.set("enrollment_id", enrollmentId);
-  if (noteCategory) u.searchParams.set("note_category", noteCategory);
-  if (videoBook) u.searchParams.set("video_book", "true");
-
-  if (rawParams) {
-    const p = new URLSearchParams(rawParams);
-    for (const [k, v] of p.entries()) u.searchParams.set(k, v);
+  u.searchParams.set("note_category", DEFAULT_NOTE_CATEGORY);
+  if (INCLUDE_VIDEO_BOOK) {
+    u.searchParams.set("video_book", "true");
   }
   return u.toString();
 }
@@ -698,9 +566,6 @@ async function fetchNotesRange({
   startDate,   // Date | undefined
   endDate,     // Date | undefined
   pageSize,
-  noteCategory,
-  videoBook,
-  rawParams,
   maxPages,
   delayMs
 }) {
@@ -714,7 +579,7 @@ async function fetchNotesRange({
   let pages = 0;
 
   while (pages < maxPages) {
-    const url = buildNotesUrl({ enrollmentId, beforeTime: beforeCursor, pageSize, noteCategory, videoBook, rawParams });
+    const url = buildNotesUrl({ enrollmentId, beforeTime: beforeCursor, pageSize });
     console.log(`Fetching page ${pages + 1} …`);
     console.log(`  → ${url}`);
     const json = await robustGetJSON(request, url);
@@ -754,33 +619,21 @@ async function fetchNotesRange({
   return deduped;
 }
 
-async function ensureAuthValid({ authPath, headless, username, password, enrollmentId }) {
+async function ensureAuthValid({ authPath, username, password }) {
   let needLogin = !fs.existsSync(authPath);
   if (!needLogin) {
     try {
       const { storageState, savedHeaders } = loadAuthStateFile(authPath);
       const { request } = await createApiRequestContext({ storageState, savedHeaders });
-      const tomorrow = addDays(new Date(), 1);
-      tomorrow.setHours(0, 0, 0, 0);
-      let r;
-      if (enrollmentId) {
-        const testUrl = buildNotesUrl({
-          enrollmentId,
-          beforeTime: formatForApi(tomorrow),
-          pageSize: 1,
-          noteCategory: "report",
-          videoBook: true,
-          rawParams: ""
-        });
-        r = await request.get(testUrl);
-      } else {
-        // Fallback: call enrollments endpoint to verify auth
+      try {
         const headers = buildApiHeaders({ storageState, savedHeaders }, { allowMissingUid: true });
         const enrollments = await fetchParentEnrollments({ request, headers });
-        r = { status: () => (Array.isArray(enrollments) ? 200 : 500) };
+        if (!Array.isArray(enrollments) || enrollments.length === 0) {
+          throw new Error("No enrollments returned when validating auth.");
+        }
+      } finally {
+        await request.dispose();
       }
-      await request.dispose();
-      if (r.status() === 401 || r.status() === 403) needLogin = true;
     } catch (err) {
       console.warn("Auth validation failed:", err?.message || err);
       needLogin = true;
@@ -791,7 +644,7 @@ async function ensureAuthValid({ authPath, headless, username, password, enrollm
       throw new Error("Missing LG_USER/LG_PASS for auto-login.");
     }
     console.log("🔐 Logging in to refresh auth …");
-    await loginAndSaveState({ username, password, authPath, headless });
+    await loginAndSaveState({ username, password, authPath });
   }
 }
 
@@ -828,7 +681,7 @@ function deriveStableId(item) {
 async function fetchParentEnrollments({ request, headers }) {
   const parentId = getHeaderValue(headers, "x-uid") ?? process.env.LG_UID?.trim();
   if (!parentId) {
-    throw new Error("Missing X-UID for enrollment lookup. Rerun `lg login` or set LG_UID env.");
+    throw new Error("Missing X-UID for enrollment lookup. Set LG_UID env or rerun the sync with credentials.");
   }
   const url = new URL(ENROLLMENTS_URL);
   url.searchParams.set("parent_id", parentId);

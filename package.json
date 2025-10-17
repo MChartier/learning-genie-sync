@@ -1,6 +1,6 @@
 {
   "name": "learning-genie-sync",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "dependencies": {
@@ -9,8 +9,6 @@
     "playwright": "^1.55.1"
   },
   "scripts": {
-    "login": "node ./lg.mjs login",
-    "fetch": "node ./lg.mjs fetch",
     "sync":  "node ./lg.mjs sync",
     "docker-build": "docker build -t learning-genie-sync ."
   }
