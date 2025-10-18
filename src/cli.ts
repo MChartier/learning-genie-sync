@@ -47,7 +47,6 @@ const INCLUDE_VIDEO_BOOK = true;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
 const DEFAULT_LOCAL_TZ = "America/Los_Angeles";
-
 let lastTimezoneOffsetHours: number | null = null;
 
 interface MediaDownloadDescriptor {
@@ -56,6 +55,15 @@ interface MediaDownloadDescriptor {
   hint: "utc" | "local";
   caption?: string;
   mediaType: "video" | "image" | "unknown";
+}
+
+interface SoftAssetLimitResult {
+  filteredItems: any[];
+  totalAssets: number;
+  selectedAssets: number;
+  limited: boolean;
+  latestTimestamp: Date | null;
+  cutoffTimestamp: Date | null;
 }
 
 const program = new Command();
@@ -67,10 +75,12 @@ program
   .option("--auth <file>", "storageState JSON path", DEFAULT_AUTH)
   .option("--outfile <file>", "intermediate JSON for the downloader", DEFAULT_OUT)
   .option("--outdir <dir>", "final download directory", DEFAULT_OUTDIR)
+  .option("--max-assets <count>", "soft limit on number of assets to sync")
   .action(async (opts) => {
     const authPath = (opts.auth as string) ?? DEFAULT_AUTH;
     const outfileBase = (opts.outfile as string) ?? DEFAULT_OUT;
     const outdirRoot = (opts.outdir as string) ?? DEFAULT_OUTDIR;
+    const maxAssets = parseMaxAssetsOption((opts as Record<string, unknown>).maxAssets);
 
     const username = process.env.LG_USER;
     const password = process.env.LG_PASS;
@@ -158,26 +168,55 @@ program
           endDate: undefined,
           pageSize: DEFAULT_COUNT,
           maxPages: MAX_SYNC_PAGES,
-          delayMs: DEFAULT_DELAY_MS
+          delayMs: DEFAULT_DELAY_MS,
+          assetLimit: typeof maxAssets === "number" ? maxAssets : undefined
         });
 
-        const outfile = multi ? appendFileSuffix(outfileBase, `-${folderBase}`) : outfileBase;
-        await writeFile(outfile, JSON.stringify({ items }, null, 2));
-        console.log(`📄 [${displayName}] Wrote ${items.length} items → ${outfile}`);
+        let processedItems = items;
+        let latestTimestampForState: Date | null = null;
 
-        if (items.length === 0) {
+        if (typeof maxAssets === "number") {
+          const limitResult = applySoftAssetLimit(items, maxAssets);
+          processedItems = limitResult.filteredItems;
+          latestTimestampForState = limitResult.latestTimestamp;
+          if (limitResult.totalAssets === 0) {
+            console.log(`🎯 [${displayName}] No downloadable assets detected.`);
+          } else if (limitResult.limited) {
+            const cutoffDetail =
+              limitResult.cutoffTimestamp != null ? ` (cutoff ${limitResult.cutoffTimestamp.toISOString()})` : "";
+            console.log(
+              `🎯 [${displayName}] Soft limit applied: selected ${limitResult.selectedAssets} of ${limitResult.totalAssets} assets${cutoffDetail}.`
+            );
+          } else {
+            console.log(
+              `🎯 [${displayName}] Soft limit of ${maxAssets} not reached; ${limitResult.totalAssets} assets available.`
+            );
+          }
+        } else {
+          latestTimestampForState = findLatestTimestamp(items);
+        }
+
+        if (!latestTimestampForState) {
+          latestTimestampForState = findLatestTimestamp(processedItems);
+        }
+
+        const outfile = multi ? appendFileSuffix(outfileBase, `-${folderBase}`) : outfileBase;
+        await writeFile(outfile, JSON.stringify({ items: processedItems }, null, 2));
+        console.log(`📄 [${displayName}] Wrote ${processedItems.length} items → ${outfile}`);
+
+        if (processedItems.length === 0) {
           console.log(`ℹ️  [${displayName}] No media in range; skipping downloader.`);
           continue;
         }
 
         await runDownloader({
-          items,
+          items: processedItems,
           outdir: childOutdir,
           timezone,
           label: displayName
         });
 
-        const latest = findLatestTimestamp(items);
+        const latest = latestTimestampForState ?? findLatestTimestamp(processedItems);
         if (latest) {
           syncState[enrollmentId] = latest.toISOString();
           stateUpdated = true;
@@ -249,6 +288,209 @@ async function runDownloader({
   );
 
   void results;
+}
+
+function applySoftAssetLimit(items: any[], maxAssets: number): SoftAssetLimitResult {
+  if (!Array.isArray(items) || items.length === 0) {
+    const safeItems = Array.isArray(items) ? items : [];
+    return {
+      filteredItems: safeItems,
+      totalAssets: 0,
+      selectedAssets: 0,
+      limited: false,
+      latestTimestamp: findLatestTimestamp(safeItems),
+      cutoffTimestamp: null
+    };
+  }
+
+  type AssetRecord = {
+    itemIndex: number;
+    mediaIndex: number;
+    timestamp: Date | null;
+  };
+
+  const records: AssetRecord[] = [];
+
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+    const item = items[itemIndex];
+    if (!item || typeof item !== "object") continue;
+    const anyItem = item as Record<string, unknown>;
+    const mediaArray = Array.isArray(anyItem.media) ? (anyItem.media as unknown[]) : null;
+    if (!mediaArray || mediaArray.length === 0) continue;
+
+    const parentTimestamp = extractTimestamp(anyItem)?.date ?? null;
+
+    for (let mediaIndex = 0; mediaIndex < mediaArray.length; mediaIndex++) {
+      const mediaEntry = mediaArray[mediaIndex];
+      if (!mediaEntry || typeof mediaEntry !== "object") continue;
+
+      const timestamp = resolveAssetTimestamp(
+        mediaEntry as Record<string, unknown>,
+        anyItem,
+        parentTimestamp
+      );
+
+      records.push({
+        itemIndex,
+        mediaIndex,
+        timestamp
+      });
+    }
+  }
+
+  const totalAssets = records.length;
+  if (totalAssets === 0) {
+    return {
+      filteredItems: items,
+      totalAssets: 0,
+      selectedAssets: 0,
+      limited: false,
+      latestTimestamp: findLatestTimestamp(items),
+      cutoffTimestamp: null
+    };
+  }
+
+  if (totalAssets <= maxAssets) {
+    return {
+      filteredItems: items,
+      totalAssets,
+      selectedAssets: totalAssets,
+      limited: false,
+      latestTimestamp: findLatestTimestamp(items),
+      cutoffTimestamp: null
+    };
+  }
+
+  records.sort((a, b) => {
+    const aTime = a.timestamp ? a.timestamp.getTime() : Number.POSITIVE_INFINITY;
+    const bTime = b.timestamp ? b.timestamp.getTime() : Number.POSITIVE_INFINITY;
+    if (aTime !== bTime) return aTime - bTime;
+    if (a.itemIndex !== b.itemIndex) return a.itemIndex - b.itemIndex;
+    return a.mediaIndex - b.mediaIndex;
+  });
+
+  const selectedRecords: AssetRecord[] = [];
+  let boundaryTime: number | null = null;
+
+  for (const record of records) {
+    if (selectedRecords.length < maxAssets) {
+      selectedRecords.push(record);
+      if (record.timestamp) {
+        boundaryTime = record.timestamp.getTime();
+      }
+      continue;
+    }
+
+    if (
+      boundaryTime != null &&
+      record.timestamp &&
+      record.timestamp.getTime() === boundaryTime
+    ) {
+      selectedRecords.push(record);
+      continue;
+    }
+
+    break;
+  }
+
+  const selectedByItem = new Map<number, Set<number>>();
+  for (const record of selectedRecords) {
+    let set = selectedByItem.get(record.itemIndex);
+    if (!set) {
+      set = new Set<number>();
+      selectedByItem.set(record.itemIndex, set);
+    }
+    set.add(record.mediaIndex);
+  }
+
+  const filteredItems: any[] = [];
+  let latestItemTimestampFallback: Date | null = null;
+
+  const pushAndTrack = (entry: any) => {
+    filteredItems.push(entry);
+    const ts = extractTimestamp(entry);
+    if (ts && (!latestItemTimestampFallback || isAfter(ts.date, latestItemTimestampFallback))) {
+      latestItemTimestampFallback = ts.date;
+    }
+  };
+
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+    const originalItem = items[itemIndex];
+    if (!originalItem || typeof originalItem !== "object") {
+      pushAndTrack(originalItem);
+      continue;
+    }
+
+    const anyItem = originalItem as Record<string, unknown>;
+    const mediaArray = Array.isArray(anyItem.media) ? (anyItem.media as unknown[]) : null;
+    if (!mediaArray) {
+      pushAndTrack(originalItem);
+      continue;
+    }
+    if (mediaArray.length === 0) {
+      pushAndTrack(originalItem);
+      continue;
+    }
+
+    const selectedSet = selectedByItem.get(itemIndex);
+    if (!selectedSet || selectedSet.size === 0) {
+      continue;
+    }
+
+    const filteredMedia = mediaArray.filter((_, idx) => selectedSet.has(idx));
+    const clonedItem = { ...anyItem, media: filteredMedia };
+    pushAndTrack(clonedItem);
+  }
+
+  let latestAssetTimestamp: Date | null = null;
+  let cutoffTimestamp: Date | null = null;
+  for (let idx = selectedRecords.length - 1; idx >= 0; idx--) {
+    const ts = selectedRecords[idx]?.timestamp ?? null;
+    if (ts && (!cutoffTimestamp || ts.getTime() > cutoffTimestamp.getTime())) {
+      cutoffTimestamp = ts;
+    }
+    if (ts && (!latestAssetTimestamp || isAfter(ts, latestAssetTimestamp))) {
+      latestAssetTimestamp = ts;
+    }
+  }
+
+  let latestTimestamp = latestAssetTimestamp ?? null;
+  if (!latestTimestamp && latestItemTimestampFallback) {
+    latestTimestamp = latestItemTimestampFallback;
+  }
+  if (!latestTimestamp) {
+    latestTimestamp = findLatestTimestamp(filteredItems);
+  }
+
+  return {
+    filteredItems,
+    totalAssets,
+    selectedAssets: selectedRecords.length,
+    limited: selectedRecords.length < totalAssets,
+    latestTimestamp: latestTimestamp ?? null,
+    cutoffTimestamp
+  };
+
+  function resolveAssetTimestamp(
+    media: Record<string, unknown>,
+    parent: Record<string, unknown>,
+    fallback: Date | null
+  ): Date | null {
+    const resolved = resolveMediaTimestamp(media, parent);
+    if (resolved) {
+      const parsed = parseTimestamp(resolved.value, { treatAsUTC: resolved.hint === "utc" });
+      if (parsed) {
+        return parsed.date;
+      }
+    }
+
+    const mediaTimestamp = extractTimestamp(media);
+    if (mediaTimestamp) {
+      return mediaTimestamp.date;
+    }
+
+    return fallback;
+  }
 }
 
 function collectMediaEntries(items: unknown[]): MediaDownloadDescriptor[] {
@@ -1000,6 +1242,18 @@ function offsetHoursToTimezone(offsetHours: number) {
   return `Etc/GMT${suffix}`;
 }
 
+function parseMaxAssetsOption(raw: unknown): number | undefined {
+  if (raw == null) return undefined;
+  const str = String(raw).trim();
+  if (!str) return undefined;
+  const value = Number.parseInt(str, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    console.error("--max-assets must be a positive integer.");
+    process.exit(8);
+  }
+  return value;
+}
+
 function selectEffectiveStartDate(userStart?: Date, derivedStart?: Date) {
   if (!userStart) return derivedStart ?? undefined;
   if (!derivedStart) return userStart;
@@ -1073,18 +1327,21 @@ async function fetchParentEnrollments({
   request: APIRequestContext;
   headers: Record<string, string>;
 }) {
-  const resp = await request.get(ENROLLMENTS_URL, { headers });
-  if (!resp.ok()) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Failed to fetch enrollments: ${resp.status()} ${resp.statusText()} ${text}`);
+  const headerUid = getHeaderValue(headers, "x-uid");
+  const trimmedHeaderUid = typeof headerUid === "string" ? headerUid.trim() : undefined;
+  const envUid = process.env.LG_UID?.trim();
+  const parentId = trimmedHeaderUid || envUid;
+  if (!parentId) {
+    throw new Error("Missing X-UID for enrollment lookup. Rerun the sync with LG_USER/LG_PASS or set LG_UID env.");
   }
-  const json = await resp.json();
-  if (Array.isArray(json?.data)) return json.data;
+
+  const url = new URL(ENROLLMENTS_URL);
+  url.searchParams.set("parent_id", parentId);
+  const json = await robustGetJSON(request, url.toString());
+
   if (Array.isArray(json)) return json;
-  if (json && typeof json === "object") {
-    return Object.values(json).flat();
-  }
-  return [];
+  if (Array.isArray(json?.data)) return json.data;
+  throw new Error("Unexpected enrollments response shape.");
 }
 
 function loadSyncStateDate(state: Record<string, string>, enrollmentId: string) {
@@ -1126,14 +1383,19 @@ function buildNotesUrl({
   beforeTime: string;
   pageSize: number;
 }) {
-  const params = new URLSearchParams({
-    enrollmentId: String(enrollmentId),
-    beforeTime,
-    pageSize: String(pageSize),
-    includeVideoBook: String(INCLUDE_VIDEO_BOOK),
-    category: DEFAULT_NOTE_CATEGORY
-  });
-  return `${NOTES_BASE}?${params.toString()}`;
+  const url = new URL(NOTES_BASE);
+  if (beforeTime) {
+    url.searchParams.set("before_time", beforeTime);
+  }
+  if (pageSize) {
+    url.searchParams.set("count", String(pageSize));
+  }
+  url.searchParams.set("enrollment_id", String(enrollmentId));
+  if (DEFAULT_NOTE_CATEGORY) {
+    url.searchParams.set("note_category", DEFAULT_NOTE_CATEGORY);
+  }
+  url.searchParams.set("video_book", INCLUDE_VIDEO_BOOK ? "true" : "false");
+  return url.toString();
 }
 
 function filterByRangeAndFindNext(items: any[], startDate?: Date, endDate?: Date) {
@@ -1193,7 +1455,8 @@ async function fetchNotesRange({
   endDate,
   pageSize,
   maxPages,
-  delayMs
+  delayMs,
+  assetLimit
 }: {
   request: APIRequestContext;
   enrollmentId: string;
@@ -1202,14 +1465,17 @@ async function fetchNotesRange({
   pageSize: number;
   maxPages: number;
   delayMs: number;
+  assetLimit?: number;
 }) {
-  const all: any[] = [];
+  const deduped: any[] = [];
+  const seen = new Set<string>();
 
   const base = endDate ? new Date(endDate.getTime()) : new Date();
   const initialUpper = addDays(base, 1);
   initialUpper.setHours(0, 0, 0, 0);
   let beforeCursor = formatForApi(initialUpper);
   let pages = 0;
+  let assetLimitInfo: SoftAssetLimitResult | null = null;
 
   while (pages < maxPages) {
     const url = buildNotesUrl({ enrollmentId, beforeTime: beforeCursor, pageSize });
@@ -1225,7 +1491,27 @@ async function fetchNotesRange({
     if (!Array.isArray(items) || items.length === 0) break;
 
     const { kept, nextCursor } = filterByRangeAndFindNext(items, startDate, endDate);
-    all.push(...kept);
+    const pageOldestTimestamp = nextCursor?.date ?? null;
+
+    for (const it of kept) {
+      const id = deriveStableId(it);
+      if (!seen.has(id)) {
+        seen.add(id);
+        deduped.push(it);
+      }
+    }
+
+    if (typeof assetLimit === "number" && Number.isFinite(assetLimit) && assetLimit > 0) {
+      assetLimitInfo = applySoftAssetLimit(deduped, assetLimit);
+      if (
+        assetLimitInfo.limited &&
+        assetLimitInfo.cutoffTimestamp &&
+        pageOldestTimestamp &&
+        isBefore(pageOldestTimestamp, assetLimitInfo.cutoffTimestamp)
+      ) {
+        break;
+      }
+    }
 
     pages += 1;
     if (!nextCursor) break;
@@ -1242,15 +1528,6 @@ async function fetchNotesRange({
     await sleep(delayMs);
   }
 
-  const seen = new Set<string>();
-  const deduped: any[] = [];
-  for (const it of all) {
-    const id = deriveStableId(it);
-    if (!seen.has(id)) {
-      seen.add(id);
-      deduped.push(it);
-    }
-  }
   return deduped;
 }
 
