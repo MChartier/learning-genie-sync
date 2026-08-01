@@ -9,6 +9,7 @@ import { fsyncDirectory, fsyncFile, writeJsonAtomic } from "./lib/atomic-json.mj
 import {
   LEDGER_FILENAME,
   extractMediaDescriptors,
+  isTerminalMediaStatus,
   loadMediaLedger,
   mergeDescriptorsIntoLedger,
   saveMediaLedger,
@@ -76,11 +77,26 @@ export async function runDownloadBatch({
     failed: 0,
     blocked: 0,
     exhausted: 0,
-    failures: []
+    unavailable: 0,
+    terminalUnavailable: 0,
+    failures: [],
+    unavailableItems: []
   };
 
+  const unavailableEntries = Object.values(ledger.media)
+    .filter(entry => entry.status === "unavailable");
+  for (const entry of unavailableEntries) {
+    const cleanup = cleanupEntryArtifacts({ entry, outdir });
+    if (cleanup.removed.length > 0) {
+      entry.lastCleanupAt = now().toISOString();
+      entry.cleanedArtifacts = mergeCleanedArtifacts(entry.cleanedArtifacts, cleanup.removed);
+      persistLedger();
+    }
+  }
+  report.terminalUnavailable = unavailableEntries.length;
+
   const entries = Object.values(ledger.media)
-    .filter(entry => entry.status !== "uploaded")
+    .filter(entry => !isTerminalMediaStatus(entry.status))
     .sort((left, right) => String(left.firstSeenAt).localeCompare(String(right.firstSeenAt)));
   let currentStagingBytes = directorySize(outdir);
 
@@ -99,6 +115,46 @@ export async function runDownloadBatch({
       continue;
     }
 
+    let remoteProbe;
+    try {
+      remoteProbe = await contentLengthResolver(entry.url);
+    } catch (error) {
+      remoteProbe = { confirmed: false, error: error?.message || String(error) };
+    }
+    const remoteObject = normalizeRemoteObjectInfo(remoteProbe);
+    if (remoteObject.confirmed && remoteObject.bytes === 0) {
+      const unavailableAt = now().toISOString();
+      const reason = confirmedEmptyReason(remoteObject);
+      const cleanup = cleanupEntryArtifacts({ entry, outdir, destination });
+      entry.status = "unavailable";
+      entry.unavailableAt ||= unavailableAt;
+      entry.lastFailureAt = unavailableAt;
+      entry.lastError = reason;
+      entry.terminalReason = reason;
+      entry.remoteObject = remoteObject;
+      entry.warningEmittedAt ||= unavailableAt;
+      entry.lastCleanupAt = cleanup.removed.length > 0 ? unavailableAt : entry.lastCleanupAt;
+      entry.cleanedArtifacts = mergeCleanedArtifacts(entry.cleanedArtifacts, cleanup.removed);
+      persistLedger({ force: true });
+      report.unavailable += 1;
+      report.terminalUnavailable += 1;
+      report.warnings += 1;
+      report.unavailableItems.push({
+        key: entry.key,
+        mediaId: entry.mediaId,
+        path: entry.relativePath,
+        error: reason,
+        unavailableAt: entry.unavailableAt,
+        cleanedArtifacts: cleanup.removed
+      });
+      logger.warn(
+        `[download] media unavailable media_id=${entry.mediaId || "unknown"} `
+        + `path=${entry.relativePath} reason=${reason}`
+      );
+      currentStagingBytes = directorySize(outdir);
+      continue;
+    }
+
     if (Number(entry.attempts || 0) >= maxAttempts) {
       report.failed += 1;
       report.exhausted += 1;
@@ -106,8 +162,7 @@ export async function runDownloadBatch({
       continue;
     }
 
-    const expectedBytes = await contentLengthResolver(entry.url).catch(() => null);
-    const reservation = positiveInteger(expectedBytes) || unknownDownloadReserveBytes;
+    const reservation = positiveInteger(remoteObject.bytes) || unknownDownloadReserveBytes;
     const capacity = inspectStorageCapacity(outdir, reservation, {
       maxStagingBytes,
       minFreeBytes,
@@ -188,7 +243,8 @@ export async function runDownloadBatch({
   logger.log(
     `[download] downloaded=${report.downloaded} bytes=${report.downloadedBytes} `
     + `skipped=${report.skipped} skipped_bytes=${report.skippedBytes} `
-    + `failed=${report.failed} warnings=${report.warnings} blocked=${report.blocked}`
+    + `failed=${report.failed} unavailable=${report.unavailable} `
+    + `warnings=${report.warnings} blocked=${report.blocked}`
   );
   return report;
 }
@@ -274,6 +330,49 @@ export async function downloadAndCommitEntry({
     stagingDeltaBytes: affectedBytesAfter - affectedBytesBefore,
     warnings
   };
+}
+
+export function cleanupEntryArtifacts({ entry, outdir, destination = path.join(outdir, entry.relativePath) }) {
+  const extension = path.extname(entry.relativePath);
+  const tempDirectory = path.join(outdir, ".lg-sync-tmp");
+  const temporaryPath = path.join(
+    tempDirectory,
+    `${sha256(entry.key).slice(0, 24)}.part${extension}`
+  );
+  const destinationSidecar = sidecarPathFor(destination, extension);
+  const temporarySidecar = sidecarPathFor(temporaryPath, extension);
+  const candidates = [
+    { filePath: destination, zeroByteOnly: true },
+    { filePath: `${destination}.aria2` },
+    { filePath: temporaryPath },
+    { filePath: `${temporaryPath}.aria2` },
+    { filePath: temporarySidecar },
+    { filePath: destinationSidecar, onlyWhenDestinationMissing: true }
+  ].filter(candidate => candidate.filePath);
+  const removed = [];
+  const touchedDirectories = new Set();
+
+  for (const candidate of candidates) {
+    let stats;
+    try {
+      stats = fs.statSync(candidate.filePath);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (!stats.isFile()) continue;
+    if (candidate.zeroByteOnly && stats.size > 0) continue;
+    if (candidate.onlyWhenDestinationMissing && fs.existsSync(destination)) continue;
+    fs.unlinkSync(candidate.filePath);
+    removed.push({
+      path: path.relative(outdir, candidate.filePath).replaceAll("\\", "/"),
+      bytes: stats.size
+    });
+    touchedDirectories.add(path.dirname(candidate.filePath));
+  }
+
+  for (const directory of touchedDirectories) fsyncDirectory(directory);
+  return { removed };
 }
 
 export async function stampMetadata({
@@ -458,11 +557,45 @@ async function resolveContentLength(url) {
   const timeout = setTimeout(() => controller.abort(), 10000);
   try {
     const response = await fetch(url, { method: "HEAD", redirect: "follow", signal: controller.signal });
-    if (!response.ok) return null;
-    return positiveInteger(response.headers.get("content-length"));
+    const contentLengthHeader = response.headers.get("content-length");
+    const bytes = nonnegativeInteger(contentLengthHeader);
+    return {
+      confirmed: response.ok && bytes !== null,
+      bytes,
+      method: "HEAD",
+      status: response.status,
+      contentType: response.headers.get("content-type") || null,
+      contentLength: contentLengthHeader
+    };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export function normalizeRemoteObjectInfo(value) {
+  if (typeof value === "number" || typeof value === "string") {
+    const bytes = nonnegativeInteger(value);
+    return { confirmed: bytes !== null, bytes };
+  }
+  if (!value || typeof value !== "object") return { confirmed: false, bytes: null };
+  const bytes = nonnegativeInteger(value.bytes ?? value.contentLength);
+  return {
+    ...value,
+    confirmed: value.confirmed === true && bytes !== null,
+    bytes
+  };
+}
+
+function confirmedEmptyReason(remoteObject) {
+  const status = remoteObject.status ? ` HTTP ${remoteObject.status}` : "";
+  const contentType = remoteObject.contentType ? ` (${remoteObject.contentType})` : "";
+  return `confirmed zero-length remote object${status}${contentType}`;
+}
+
+function mergeCleanedArtifacts(previous, removed) {
+  const merged = new Map();
+  for (const artifact of [...(previous || []), ...removed]) merged.set(artifact.path, artifact);
+  return [...merged.values()];
 }
 
 function isCompleteDestination(filePath) {
@@ -537,6 +670,12 @@ function zonedComponentsToDate(components, timezone) {
 function positiveInteger(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function nonnegativeInteger(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 && Number.isInteger(parsed) ? parsed : null;
 }
 
 function numberSetting(name, fallback) {

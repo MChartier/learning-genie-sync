@@ -80,6 +80,64 @@ test("a successful Immich upload deletes the staged file and durably marks its l
   assert.equal(loadMediaLedger(ledgerPath).media["id:media-1"].status, "uploaded");
 });
 
+test("a newly unavailable empty item alerts once without blocking valid staged media", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lg-workflow-unavailable-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const mediaRoot = path.join(root, "staging");
+  const mediaPath = path.join(mediaRoot, "child", "valid.jpg");
+  const zeroPath = path.join(mediaRoot, "child", "empty.mp4");
+  const syncReportPath = path.join(root, "sync-report.json");
+  fs.mkdirSync(path.dirname(mediaPath), { recursive: true });
+  fs.writeFileSync(mediaPath, "valid media");
+  fs.writeFileSync(zeroPath, "");
+  const alerts = [];
+  let immichInvocations = 0;
+
+  const result = await runWorkflowAttempt({
+    mediaRoot,
+    authPath: path.join(root, "auth.json"),
+    statePath: path.join(root, "state.json"),
+    outfile: path.join(root, "input.json"),
+    syncReportPath,
+    immichUrl: "https://immich.example/api",
+    immichApiKey: "test-key",
+    immichCli: "immich-test",
+    alert: async (title, body, options) => { alerts.push({ title, body, options }); return true; },
+    commandRunner: async command => {
+      if (command === process.execPath) {
+        fs.unlinkSync(zeroPath);
+        fs.writeFileSync(syncReportPath, JSON.stringify({
+          failed: 0,
+          downloaded: 1,
+          downloadedBytes: 11,
+          unavailable: 1,
+          unavailableItems: [{
+            mediaId: "d4b27c89-433b-42d2-81d4-d1aebef5de3e",
+            path: "empty.mp4",
+            error: "confirmed zero-length remote object HTTP 200 (video/mp4)"
+          }]
+        }));
+        return { code: 0 };
+      }
+      immichInvocations += 1;
+      fs.unlinkSync(mediaPath);
+      return { code: 0 };
+    }
+  });
+
+  assert.equal(result.download.failed, 0);
+  assert.equal(result.download.unavailable, 1);
+  assert.equal(result.uploaded, 1);
+  assert.equal(result.deleted, 1);
+  assert.equal(immichInvocations, 1);
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].title, /permanently unavailable/);
+  assert.match(alerts[0].body, /d4b27c89-433b-42d2-81d4-d1aebef5de3e/);
+  assert.match(alerts[0].body, /empty\.mp4/);
+  assert.equal(fs.existsSync(mediaPath), false);
+  assert.equal(fs.existsSync(zeroPath), false);
+});
+
 test("workflow retries are exponential and bounded", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lg-retry-test-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

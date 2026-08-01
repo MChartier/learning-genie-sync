@@ -20,6 +20,7 @@ export async function runWorkflowAttempt({
   syncReportPath = process.env.SYNC_REPORT_PATH || "/data/last-sync-report.json",
   commandRunner = defaultCommandRunner,
   logger = console,
+  alert = sendAlert,
   immichUrl = process.env.IMMICH_INSTANCE_URL,
   immichApiKey = process.env.IMMICH_API_KEY,
   immichCli = process.env.IMMICH_CLI_PATH || path.join(__dirname, "node_modules", ".bin", "immich"),
@@ -45,6 +46,7 @@ export async function runWorkflowAttempt({
   ], { env: process.env, logger });
 
   const syncReport = readJsonFile(syncReportPath, emptySyncReport());
+  await notifyUnavailableMedia(syncReport, { alert, logger });
   const staged = summarizeMedia(mediaRoot);
   verifyStaging(staged);
   logger.log(
@@ -132,7 +134,7 @@ export async function runWorkflowWithRetries({
   let lastError;
   for (let index = 0; index < maxRetries; index += 1) {
     try {
-      const result = await attempt();
+      const result = await attempt({ alert });
       const degraded = Number(result.download?.failed || 0) > 0;
       const timestamp = now().toISOString();
       state.lastRunAt = timestamp;
@@ -218,6 +220,25 @@ export function verifyStaging(summary) {
   }
 }
 
+export async function notifyUnavailableMedia(syncReport, { alert = sendAlert, logger = console } = {}) {
+  const count = Number(syncReport?.unavailable || 0);
+  if (count <= 0) return false;
+  const items = (syncReport.unavailableItems || []).slice(0, 10);
+  const details = items.map(item => {
+    const identifier = item.mediaId || item.key || "unknown media";
+    return `${identifier} -> ${item.path || "unknown path"}: ${item.error || "source unavailable"}`;
+  });
+  const remaining = Math.max(0, count - items.length);
+  if (remaining > 0) details.push(`...and ${remaining} more unavailable item(s)`);
+  const body = [
+    `${count} media item(s) were confirmed permanently unavailable and removed from the retry queue.`,
+    ...details
+  ].join("\n");
+  logger.warn(`[workflow] newly_unavailable=${count}; the durable ledger retains audit details`);
+  await alert("Learning Genie media permanently unavailable", body, { priority: "high" });
+  return true;
+}
+
 export function loadWorkflowState(statePath) {
   const state = readJsonFile(statePath, { version: 1, consecutiveFailures: 0 });
   state.version = 1;
@@ -291,7 +312,16 @@ function workflowResult({ syncReport, staged, uploaded, uploadedBytes, deleted, 
 }
 
 function emptySyncReport() {
-  return { downloaded: 0, downloadedBytes: 0, skipped: 0, skippedBytes: 0, failed: 0, warnings: 0 };
+  return {
+    downloaded: 0,
+    downloadedBytes: 0,
+    skipped: 0,
+    skippedBytes: 0,
+    failed: 0,
+    unavailable: 0,
+    unavailableItems: [],
+    warnings: 0
+  };
 }
 
 function splitShellWords(value) {
