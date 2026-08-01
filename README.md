@@ -33,7 +33,35 @@ retry from creating numbered copies.
 
 ## Docker deployment
 
-Build the image:
+Every push to the default `master` branch publishes the image to GitHub
+Container Registry using the version in `package.json`. For example, version
+`0.1.1` publishes both:
+
+```text
+ghcr.io/mchartier/learning-genie-sync:0.1.1
+ghcr.io/mchartier/learning-genie-sync:latest
+```
+
+Use the SemVer tag for a controlled upgrade, or `latest` to track the newest
+successful build from `master`:
+
+```bash
+docker pull ghcr.io/mchartier/learning-genie-sync:0.1.1
+docker pull ghcr.io/mchartier/learning-genie-sync:latest
+```
+
+GitHub creates a newly published container package as private. Make the package
+public once in its GitHub package settings for anonymous pulls, or authenticate
+Docker to `ghcr.io` with an account that has `read:packages` access.
+
+To update a Compose deployment that uses `latest`:
+
+```bash
+docker compose pull learning-genie-sync
+docker compose up -d learning-genie-sync
+```
+
+For local development, the image can still be built directly:
 
 ```bash
 docker build -t learning-genie-sync .
@@ -60,7 +88,7 @@ docker run -d \
   --restart unless-stopped \
   --env-file learning-genie-sync.env \
   -v /srv/data/learning-genie-sync:/data \
-  learning-genie-sync
+  ghcr.io/mchartier/learning-genie-sync:latest
 ```
 
 Only this container should schedule the import. Remove the old independent
