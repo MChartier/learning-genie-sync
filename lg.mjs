@@ -234,7 +234,10 @@ program.command("sync")
         failed: 0,
         blocked: 0,
         exhausted: 0,
+        unavailable: 0,
+        terminalUnavailable: 0,
         failures: [],
+        unavailableItems: [],
         enrollments: {}
       };
 
@@ -349,7 +352,8 @@ program.command("sync")
       console.log(
         `[sync] downloaded=${aggregateReport.downloaded} bytes=${aggregateReport.downloadedBytes} `
         + `skipped=${aggregateReport.skipped} skipped_bytes=${aggregateReport.skippedBytes} `
-        + `failed=${aggregateReport.failed} warnings=${aggregateReport.warnings}`
+        + `failed=${aggregateReport.failed} unavailable=${aggregateReport.unavailable} `
+        + `warnings=${aggregateReport.warnings}`
       );
       if (systemicFailures > 0) process.exitCode = 5;
     } finally {
@@ -1016,11 +1020,14 @@ function aggregateDownloadReport(aggregate, enrollmentId, report) {
   aggregate.ledgerDurable &&= report.ledgerDurable === true;
   for (const field of [
     "discovered", "downloaded", "downloadedBytes", "skipped", "skippedBytes",
-    "warnings", "failed", "blocked", "exhausted"
+    "warnings", "failed", "blocked", "exhausted", "unavailable", "terminalUnavailable"
   ]) {
     aggregate[field] += Number(report[field] || 0);
   }
   for (const failure of report.failures || []) {
     aggregate.failures.push({ enrollmentId, ...failure });
+  }
+  for (const unavailable of report.unavailableItems || []) {
+    aggregate.unavailableItems.push({ enrollmentId, ...unavailable });
   }
 }

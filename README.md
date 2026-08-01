@@ -28,6 +28,10 @@ retry from creating numbered copies.
 - JSON state files use write, fsync, and atomic rename. Legacy timestamp-only
   `sync-state.json` files migrate automatically.
 - Workflow and per-file retries use exponential backoff and hard attempt limits.
+- A successful remote probe that reports an exact zero-byte object marks that
+  media `unavailable`, removes its zero-byte/aria2 artifacts, and emits one
+  warning without degrading every future run. Failed or inconclusive probes
+  remain retryable and are never treated as permanent.
 - `flock` prevents overlapping scheduled or manually triggered runs.
 - Downloads stop before the staging ceiling or minimum-free-space reserve is crossed.
 
@@ -35,10 +39,10 @@ retry from creating numbered copies.
 
 Every push to the default `master` branch publishes the image to GitHub
 Container Registry using the version in `package.json`. For example, version
-`0.1.1` publishes both:
+`0.1.2` publishes both:
 
 ```text
-ghcr.io/mchartier/learning-genie-sync:0.1.1
+ghcr.io/mchartier/learning-genie-sync:0.1.2
 ghcr.io/mchartier/learning-genie-sync:latest
 ```
 
@@ -46,7 +50,7 @@ Use the SemVer tag for a controlled upgrade, or `latest` to track the newest
 successful build from `master`:
 
 ```bash
-docker pull ghcr.io/mchartier/learning-genie-sync:0.1.1
+docker pull ghcr.io/mchartier/learning-genie-sync:0.1.2
 docker pull ghcr.io/mchartier/learning-genie-sync:latest
 ```
 
@@ -142,12 +146,16 @@ The volume contains:
 - `auth.storage.json`: Learning Genie session data.
 - `sync-state.json`: versioned per-enrollment fetch and completion watermarks.
 - `<child>/.learning-genie-ledger.json`: status, attempts, URL, destination, and
-  errors for each media item.
+  errors for each media item. Confirmed empty sources remain here with status
+  `unavailable`, their media ID/path/error, cleanup audit, and timestamps.
 - `workflow-state.json`: last run, last full success, failure count, and summary.
 - `last-sync-report.json`: counts and bytes for the most recent download stage.
 
 Do not delete the ledgers during routine cleanup. They are what keep already
 imported assets from being downloaded again after Immich removes local copies.
+If Learning Genie repairs an unavailable source, it can be replayed manually by
+setting that ledger entry back to `pending` with `attempts` set to `0`; changing
+the source object's canonical path also resets it automatically.
 
 ## Local development
 
