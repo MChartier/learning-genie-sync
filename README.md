@@ -1,134 +1,164 @@
-# Learning Genie Sync CLI
+# Learning Genie Sync
 
-This project automates downloading photos/videos for parent accounts on [Learning Genie](https://www.learning-genie.com/).
-It wraps Playwright to log in, pulls the Notes API for every enrolled child, and runs a bash downloader that saves the media with local EXIF timestamps.
+Learning Genie Sync downloads family photos and videos, writes capture metadata,
+and can import the verified files into Immich. Scheduled containers run one
+locked workflow:
 
-## Features
+```text
+download -> verify -> Immich upload -> delete successfully imported files
+```
 
-- Playwright-based login that captures persistent storage state and required headers (`X-UID`, timezone, etc.).
-- CLI commands:
-  - `login`: interactive login to refresh auth storage.
-  - `fetch`: download raw Notes JSON for a single enrollment/date range.
-  - `sync`: multi-enrollment workflow that logs in if needed, fetches only new entries, and runs the downloader per child.
-- Incremental sync: tracks the latest synced timestamp per enrollment in a state file so reruns only fetch new media.
-- Per-child timezone detection so downloaded media gets EXIF data in local time.
-- Docker container with Chromium/Playwright, `jq`, `supercronic`, and an optional cron schedule via `CRON_EXPRESSION`.
+The downloader is designed to be safe to repeat. aria2 writes to deterministic
+temporary paths with automatic renaming disabled, ExifTool runs before the
+final file is atomically renamed, and a durable per-media ledger prevents a
+retry from creating numbered copies.
 
-## Prerequisites (local)
+## Reliability model
 
-- Node.js 20+
-- npm
-- Playwright dependencies (for Chromium):
-  ```bash
-  npx playwright install
-  sudo npx playwright install-deps
-  ```
-- Runtime dependencies used by the downloader: `jq`, `aria2c`, `exiftool`, `date` (typically preinstalled on most Linux distributions).
+- Existing non-empty destination files are adopted instead of downloaded again.
+- Interrupted aria2 downloads stay under `.lg-sync-tmp/` and resume on the next attempt.
+- A file is marked complete only after metadata is written, the file is synced,
+  and it is atomically renamed to its final path.
+- Known ExifTool character-encoding warnings are logged without failing the file.
+  Genuine metadata failures remain in the ledger for a later retry and do not
+  terminate the container.
+- Every media ID (or URL hash when no ID exists) has its own durable ledger entry.
+  The fetch cursor can advance once the retry queue is durable; the stricter
+  completion watermark advances only when every item in that batch succeeds.
+- JSON state files use write, fsync, and atomic rename. Legacy timestamp-only
+  `sync-state.json` files migrate automatically.
+- Workflow and per-file retries use exponential backoff and hard attempt limits.
+- `flock` prevents overlapping scheduled or manually triggered runs.
+- Downloads stop before the staging ceiling or minimum-free-space reserve is crossed.
 
-## Setup (local)
+## Docker deployment
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. Login once to capture auth state (this stores cookies + X-UID under `auth.storage.json`):
-   ```bash
-   LG_USER="you@example.com" LG_PASS="secret" node ./lg.mjs login --headful
-   ```
-   > `--headful` is optional; omit it if you trust headless login.
-
-3. Run a one-off sync:
-   ```bash
-   LG_USER="you@example.com" LG_PASS="secret" \
-   node ./lg.mjs sync \
-     --start 2025-09-01 --end 2025-09-30 \
-     --outdir ./downloads
-   ```
-
-   - Omitting `--start/--end` will fetch “all history”, but subsequent runs will only pull new media (the CLI records the last-synced timestamp per child).
-   - Add `--enrollment <GUID>` to limit to a specific child.
-   - Output JSONs are written to `input.json` (or suffixed copies per child) before the downloader runs.
-
-4. Run the downloader script directly (if needed):
-   ```bash
-   ./learning-genie-download.sh input.json ./downloads
-   ```
-
-## Docker Usage
-
-The project ships with a Dockerfile based on `mcr.microsoft.com/playwright:v1.55.1-jammy` and installs everything needed (Chromium, dependencies, `jq`, `supercronic`).
-
-### Build
+Build the image:
 
 ```bash
 docker build -t learning-genie-sync .
 ```
 
-### Run once
+Use an environment file so credentials do not enter shell history:
+
+```dotenv
+LG_USER=parent@example.com
+LG_PASS=replace-me
+IMMICH_INSTANCE_URL=https://immich.example.com/api
+IMMICH_API_KEY=replace-me
+CRON_EXPRESSION=0 17 * * *
+TZ=America/Los_Angeles
+NTFY_URL=https://ntfy.example.com
+NTFY_TOPIC=darkmachines
+```
+
+Then start the scheduled service:
 
 ```bash
-docker run --rm \
-  -e LG_USER='you@example.com' \
-  -e LG_PASS='secret' \
-  -v /path/on/host:/data \
+docker run -d \
+  --name learning-genie-sync \
+  --restart unless-stopped \
+  --env-file learning-genie-sync.env \
+  -v /srv/data/learning-genie-sync:/data \
   learning-genie-sync
 ```
 
-- `/data` is the default volume used for persistent auth + downloads. The container writes:
-  - `/data/auth.storage.json`
-  - `/data/<ChildName>/...` (media)
-- You can pass extra CLI args via `SYNC_ARGS`, for example to restrict a date range:
-  ```bash
-  docker run --rm \
-    -e LG_USER='you@example.com' \
-    -e LG_PASS='secret' \
-    -e SYNC_ARGS='--start 2025-09-01 --end 2025-09-30' \
-    -v /path/on/host:/data \
-    learning-genie-sync
-  ```
+Only this container should schedule the import. Remove the old independent
+Immich upload cron job; a fixed ten-minute offset can race a still-running
+download. If the initial workflow fails, bounded retries finish and the
+container keeps its scheduler alive rather than entering a Docker restart loop.
 
-### Scheduled runs (cron)
+When `IMMICH_INSTANCE_URL` and `IMMICH_API_KEY` are omitted, the same image runs
+in download-only mode and leaves verified media in staging. When configured,
+the bundled official `@immich/cli` runs recursively with `--delete` and
+`--delete-duplicates`; local media is considered uploaded only after that
+command succeeds.
 
-Set `CRON_EXPRESSION` with any standard 5-field cron string. The entrypoint performs a sync immediately, then schedules future runs with `supercronic`.
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `LG_USER`, `LG_PASS` | required | Learning Genie credentials |
+| `CRON_EXPRESSION` | unset | Five-field schedule; unset performs one workflow |
+| `AUTH_PATH` | `/data/auth.storage.json` | Persistent Playwright authentication state |
+| `STATE_PATH` | `/data/sync-state.json` | Atomic per-enrollment fetch/completion state |
+| `OUTDIR` | `/data` | Staging root and per-child media directories |
+| `OUTFILE` | `/tmp/input.json` | Temporary Learning Genie response path |
+| `SYNC_ARGS` | unset | Additional arguments passed to `lg.mjs sync` |
+| `IMMICH_INSTANCE_URL` | unset | Immich API URL, normally ending in `/api` |
+| `IMMICH_API_KEY` | unset | Immich API key |
+| `DELETE_AFTER_UPLOAD` | `true` | Ask Immich CLI to delete uploaded assets and duplicates |
+| `IMMICH_AUTO_CREATE_ALBUM` | `false` | Opt in to creating albums from child folder names |
+| `LOCK_PATH` | `/data/.learning-genie-sync.lock` | Non-overlap lock file |
+| `DOWNLOAD_MAX_RETRIES` | `3` | Attempts for one media item during one run |
+| `MAX_MEDIA_ATTEMPTS` | `10` | Durable maximum attempts for one media item |
+| `LEDGER_FLUSH_EVERY` | `100` | Successful entries per atomic ledger checkpoint |
+| `WORKFLOW_MAX_RETRIES` | `3` | Attempts for the complete sequential workflow |
+| `MAX_STAGING_BYTES` | `21474836480` | 20 GiB hard staging ceiling; `0` disables it |
+| `MIN_FREE_BYTES` | `5368709120` | 5 GiB filesystem reserve; `0` disables it |
+| `UNKNOWN_DOWNLOAD_RESERVE_BYTES` | `536870912` | Reservation when a server omits content length |
+| `STAGING_ALERT_BYTES` | `10737418240` | Alert threshold for staging size |
+| `STALE_AFTER_HOURS` | `48` | Alert when no fully successful run is this recent |
+| `ALERT_FAILURE_THRESHOLD` | `3` | Consecutive workflow failures before urgent alerting |
+| `NTFY_URL`, `NTFY_TOPIC` | unset | Optional ntfy base URL and topic |
+| `ALERT_WEBHOOK_URL` | unset | Optional direct ntfy-compatible webhook URL |
+| `LOCAL_TZ` | derived | Override the per-child EXIF timezone |
+
+API retries can be tuned with `API_RETRY_BASE_MS` and `API_RETRY_MAX_MS`;
+workflow retries use `WORKFLOW_RETRY_BASE_MS` and `WORKFLOW_RETRY_MAX_MS`.
+
+## Persistent state
+
+The volume contains:
+
+- `auth.storage.json`: Learning Genie session data.
+- `sync-state.json`: versioned per-enrollment fetch and completion watermarks.
+- `<child>/.learning-genie-ledger.json`: status, attempts, URL, destination, and
+  errors for each media item.
+- `workflow-state.json`: last run, last full success, failure count, and summary.
+- `last-sync-report.json`: counts and bytes for the most recent download stage.
+
+Do not delete the ledgers during routine cleanup. They are what keep already
+imported assets from being downloaded again after Immich removes local copies.
+
+## Local development
+
+Install dependencies and Playwright:
 
 ```bash
-docker run --rm \
-  -e LG_USER='you@example.com' \
-  -e LG_PASS='secret' \
-  -e CRON_EXPRESSION='0 18 * * 1-5' \
-  -v /path/on/host:/data \
-  learning-genie-sync
+npm install
+npx playwright install
 ```
 
-Example above runs at 6 pm every weekday.
+Run a one-off download-only sync:
 
-### Environment variables
+```bash
+LG_USER='parent@example.com' LG_PASS='replace-me' npm run sync -- \
+  --outdir ./downloads
+```
 
-| Name            | Required | Default                      | Description |
-|-----------------|----------|------------------------------|-------------|
-| `LG_USER`       | Yes      | —                            | Parent account email |
-| `LG_PASS`       | Yes      | —                            | Parent account password |
-| `CRON_EXPRESSION` | No     | *(unset)*                    | Cron schedule for recurring syncs |
-| `SYNC_ARGS`     | No       | *(empty)*                    | Extra CLI flags for `lg.mjs sync` |
-| `OUTDIR`        | No       | `/data`                      | Root directory for downloads (maps to host volume) |
-| `OUTFILE`       | No       | `/tmp/input.json`            | Base JSON output file per sync |
-| `AUTH_PATH`     | No       | `/data/auth.storage.json`    | Storage state path |
-| `STATE_PATH`    | No       | `/data/sync-state.json`      | Persistent per-enrollment watermark store |
-| `LOCAL_TZ`      | No       | *(Derived per child)*        | Override timezone for downloader (rarely needed) |
+Run the regression suite:
 
-## Development Tips
+```bash
+npm test
+```
 
-- `node lg.mjs login --headful` → capture fresh auth after password changes or when `X-UID` becomes invalid.
-- `node lg.mjs fetch --enrollment <GUID> --start YYYY-MM-DD --end YYYY-MM-DD --out out.json` → inspect raw Notes.
-- `npm run sync` (after setting `LG_USER`/`LG_PASS`) → convenience wrapper around `node lg.mjs sync`.
-- The downloader expects `jq`, `aria2c`, and `exiftool`; the Docker image ships with these, but on bare metal you may need to install them.
+The tests cover existing destinations, benign ExifTool warnings, interrupted
+aria2 downloads, genuine per-file failures, failed Immich uploads, bounded
+retry behavior, atomic state, legacy migration, and success-only completion
+watermarks.
 
-## Known Limitations
+## Upgrading an existing two-cron deployment
 
-- Learning Genie occasionally returns duplicate or overlapping Note pages; the CLI dedupes on note/media IDs but may still download revised content if metadata changes.
-- During login, Playwright saves the storage state with captured headers (`X-UID`, timezone). If those headers are missing (e.g., network issues), rerun the login command.
-- Cron jobs run within the container timezone (UTC). When specifying `CRON_EXPRESSION`, convert to UTC if your host uses a different timezone.
+1. Keep the old downloader stopped while confirmed numbered duplicates and
+   stale `.aria2` remnants are cleaned up.
+2. Preserve `auth.storage.json`, `sync-state.json`, and every verified
+   unsuffixed original.
+3. Build this image and configure the Immich URL/key in this service.
+4. Disable the independent Immich upload cron container/job.
+5. Start this service with one `CRON_EXPRESSION` and watch the first supervised run.
+6. Confirm `workflow-state.json`, `sync-state.json`, and the per-child ledgers advance.
+7. Confirm the log summary reports expected downloaded, uploaded, deleted, and byte counts.
 
-## License
-
-MIT (see `LICENSE` if provided).
+The narrowly scoped deletion of historical numbered copies is an operational
+migration step, not something this application performs automatically.

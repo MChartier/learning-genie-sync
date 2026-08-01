@@ -9,7 +9,7 @@ RUN curl -fsSLo /usr/local/bin/supercronic \
       https://github.com/aptible/supercronic/releases/download/v0.2.30/supercronic-linux-amd64 \
     && chmod +x /usr/local/bin/supercronic \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq aria2 exiftool tzdata \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq aria2 exiftool tzdata util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package manifests and install deps first for better caching
@@ -18,6 +18,8 @@ RUN npm install --omit=dev
 
 # Copy application code
 COPY lg.mjs ./
+COPY download-media.mjs workflow.mjs ./
+COPY lib ./lib
 COPY learning-genie-download.sh ./
 COPY docker ./docker
 
@@ -31,6 +33,8 @@ ENV NODE_ENV=production \
     OUTDIR=/data \
     OUTFILE=/tmp/input.json \
     AUTH_PATH=/data/auth.storage.json \
-    STATE_PATH=/data/sync-state.json
+    STATE_PATH=/data/sync-state.json \
+    SYNC_REPORT_PATH=/data/last-sync-report.json \
+    WORKFLOW_STATE_PATH=/data/workflow-state.json
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

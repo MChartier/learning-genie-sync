@@ -27,6 +27,13 @@ import { fileURLToPath } from "url";
 import { addDays, addMilliseconds, isAfter, isBefore, parseISO, subMilliseconds, format } from "date-fns";
 import { execFile as _execFile } from "child_process";
 import { promisify } from "util";
+import { readJsonFile, writeJsonAtomic } from "./lib/atomic-json.mjs";
+import {
+  getEnrollmentFetchWatermark,
+  loadSyncStateFile,
+  recordEnrollmentResult,
+  saveSyncStateFile
+} from "./lib/sync-state.mjs";
 
 const execFile = promisify(_execFile);
 
@@ -48,6 +55,8 @@ const ENROLLMENTS_URL = "https://api2.learning-genie.com/api/v1/Enrollments";
 const DEFAULT_COUNT = 50;
 const DEFAULT_DELAY_MS = 350; // between API calls
 const MAX_RETRIES = 4;
+const RETRY_BASE_MS = Number(process.env.API_RETRY_BASE_MS || 2000);
+const RETRY_MAX_MS = Number(process.env.API_RETRY_MAX_MS || 30000);
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0";
 
 let lastTimezoneOffsetHours = null;
@@ -72,7 +81,6 @@ program.command("login")
     const password = opts.password ?? process.env.LG_PASS;
     if (!username || !password) {
       console.error("LG_USER and LG_PASS env (or --username/--password) required.");
-      console.error("Got: username=", username, " password=", password);
       process.exit(2);
     }
     await loginAndSaveState({ username, password, authPath: opts.auth, headless: !opts.headful });
@@ -146,6 +154,7 @@ program.command("sync")
   .option("--state <file>", "sync state JSON path", DEFAULT_STATE)
   .option("--outdir <dir>", "final download directory", path.join(process.cwd(), "downloads"))
   .option("--script <path>", "path to your bash script", "./learning-genie-download.sh")
+  .option("--report <file>", "machine-readable aggregate download report", process.env.SYNC_REPORT_PATH)
   .option("--raw-params <queryString>", "extra query params")
   .option("--headful", "show browser UI for login/captcha", false)
   .action(async (opts) => {
@@ -167,7 +176,7 @@ program.command("sync")
 
     // 2) Fetch date-range JSON
     const statePath = opts.state;
-    const syncState = loadSyncState(statePath);
+    const syncState = loadSyncStateFile(statePath);
 
     const { storageState, savedHeaders } = loadAuthStateFile(opts.auth);
     let request;
@@ -211,7 +220,23 @@ program.command("sync")
       const usedFolderNames = new Map();
       const multi = targetEnrollments.length > 1;
 
-      let stateUpdated = false;
+      let systemicFailures = 0;
+      const aggregateReport = {
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        ledgerDurable: true,
+        discovered: 0,
+        downloaded: 0,
+        downloadedBytes: 0,
+        skipped: 0,
+        skippedBytes: 0,
+        warnings: 0,
+        failed: 0,
+        blocked: 0,
+        exhausted: 0,
+        failures: [],
+        enrollments: {}
+      };
 
       for (const enrollment of targetEnrollments) {
         const enrollmentId = extractEnrollmentId(enrollment);
@@ -229,7 +254,7 @@ program.command("sync")
           console.log(`🌐 [${displayName}] Using timezone ${timezone} for EXIF metadata`);
         }
 
-        const storedISO = syncState[enrollmentId];
+        const storedISO = getEnrollmentFetchWatermark(syncState, enrollmentId);
         let storedDate = null;
         if (storedISO) {
           try {
@@ -268,37 +293,65 @@ program.command("sync")
         fs.writeFileSync(outfile, JSON.stringify({ items }, null, 2));
         console.log(`📄 [${displayName}] Wrote ${items.length} items → ${outfile}`);
 
-        if (items.length === 0) {
-          console.log(`ℹ️  [${displayName}] No media in range; skipping downloader.`);
-          continue;
-        }
-
         await fs.promises.mkdir(childOutdir, { recursive: true }).catch(() => {});
+        const downloadReportPath = path.join(childOutdir, ".last-download-report.json");
+        if (items.length === 0) {
+          console.log(`ℹ️  [${displayName}] No new media; checking the durable retry ledger.`);
+        }
         console.log(`⬇️  [${displayName}] Running: ${opts.script} "${outfile}" "${childOutdir}"`);
         try {
           const env = { ...process.env };
           if (timezone) env.LOCAL_TZ = timezone;
+          env.DOWNLOAD_REPORT_PATH = downloadReportPath;
           const { stdout, stderr } = await execFile(opts.script, [outfile, childOutdir], {
-            env
+            env,
+            maxBuffer: 64 * 1024 * 1024
           });
           if (stdout) process.stdout.write(stdout);
           if (stderr) process.stderr.write(stderr);
           console.log(`✅ [${displayName}] Sync complete.`);
 
+          const downloadReport = readJsonFile(downloadReportPath, {
+            ledgerDurable: false,
+            failed: 1,
+            failures: [{ error: "downloader did not produce a report" }]
+          });
+          aggregateDownloadReport(aggregateReport, enrollmentId, downloadReport);
           const latest = findLatestTimestamp(items);
           if (latest) {
-            syncState[enrollmentId] = latest.toISOString();
-            stateUpdated = true;
+            recordEnrollmentResult(syncState, enrollmentId, {
+              latestTimestamp: latest,
+              ledgerDurable: downloadReport.ledgerDurable === true,
+              failedCount: Number(downloadReport.failed || 0)
+            });
+            saveSyncStateFile(statePath, syncState);
           }
         } catch (err) {
           console.error(`Downloader script failed for ${displayName}:`, err?.stderr || err?.message || err);
-          process.exit(5);
+          systemicFailures += 1;
+          aggregateReport.ledgerDurable = false;
+          aggregateReport.failed += 1;
+          aggregateReport.failures.push({ enrollmentId, error: err?.stderr || err?.message || String(err) });
+          const latest = findLatestTimestamp(items);
+          if (latest) {
+            recordEnrollmentResult(syncState, enrollmentId, {
+              latestTimestamp: latest,
+              ledgerDurable: false,
+              failedCount: 1
+            });
+            saveSyncStateFile(statePath, syncState);
+          }
         }
       }
 
-      if (stateUpdated) {
-        saveSyncState(statePath, syncState);
-      }
+      aggregateReport.finishedAt = new Date().toISOString();
+      if (opts.report) writeJsonAtomic(opts.report, aggregateReport);
+      console.log(
+        `[sync] downloaded=${aggregateReport.downloaded} bytes=${aggregateReport.downloadedBytes} `
+        + `skipped=${aggregateReport.skipped} skipped_bytes=${aggregateReport.skippedBytes} `
+        + `failed=${aggregateReport.failed} warnings=${aggregateReport.warnings}`
+      );
+      if (systemicFailures > 0) process.exitCode = 5;
     } finally {
       await request.dispose();
     }
@@ -677,10 +730,22 @@ function filterByRangeAndFindNext(items, startDate, endDate) {
 }
 
 async function robustGetJSON(request, url, tryNum = 0) {
-  const resp = await request.get(url);
+  let resp;
+  try {
+    resp = await request.get(url);
+  } catch (error) {
+    if (tryNum < MAX_RETRIES) {
+      const backoff = Math.min(RETRY_BASE_MS * 2 ** tryNum, RETRY_MAX_MS);
+      console.warn(`GET failed (${error?.message || error}); retrying in ${backoff}ms`);
+      await sleep(backoff);
+      return robustGetJSON(request, url, tryNum + 1);
+    }
+    throw error;
+  }
   if (resp.status() >= 500 || resp.status() === 429) {
     if (tryNum < MAX_RETRIES) {
-      const backoff = Math.min(2000 * (tryNum + 1), 8000);
+      const backoff = Math.min(RETRY_BASE_MS * 2 ** tryNum, RETRY_MAX_MS);
+      console.warn(`GET returned ${resp.status()}; retrying in ${backoff}ms`);
       await sleep(backoff);
       return robustGetJSON(request, url, tryNum + 1);
     }
@@ -946,20 +1011,16 @@ function findLatestTimestamp(items) {
   return latest;
 }
 
-function loadSyncState(statePath) {
-  try {
-    const raw = fs.readFileSync(statePath, "utf8");
-    const data = JSON.parse(raw);
-    if (data && typeof data === "object") {
-      return data;
-    }
-  } catch {}
-  return {};
-}
-
-function saveSyncState(statePath, state) {
-  try {
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  } catch {}
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+function aggregateDownloadReport(aggregate, enrollmentId, report) {
+  aggregate.enrollments[enrollmentId] = report;
+  aggregate.ledgerDurable &&= report.ledgerDurable === true;
+  for (const field of [
+    "discovered", "downloaded", "downloadedBytes", "skipped", "skippedBytes",
+    "warnings", "failed", "blocked", "exhausted"
+  ]) {
+    aggregate[field] += Number(report[field] || 0);
+  }
+  for (const failure of report.failures || []) {
+    aggregate.failures.push({ enrollmentId, ...failure });
+  }
 }

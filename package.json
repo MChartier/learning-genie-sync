@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "dependencies": {
+    "@immich/cli": "3.0.3",
     "commander": "^12.1.0",
     "date-fns": "^4.1.0",
     "playwright": "^1.55.1"
@@ -11,7 +12,8 @@
   "scripts": {
     "login": "node ./lg.mjs login",
     "fetch": "node ./lg.mjs fetch",
-    "sync":  "node ./lg.mjs sync",
+    "sync": "node ./lg.mjs sync",
+    "test": "node --test",
     "docker-build": "docker build -t learning-genie-sync ."
   }
 }
