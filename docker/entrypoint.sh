@@ -8,9 +8,12 @@ if [[ -n "$CRON_EXPRESSION" ]]; then
     echo "supercronic not installed; cannot use CRON_EXPRESSION" >&2
     exit 1
   fi
-  echo "Running initial sync before scheduling …"
-  /app/docker/run-sync.sh
-  echo "Initial sync finished. Scheduling future runs."
+  echo "Running initial workflow before scheduling …"
+  if /app/docker/run-sync.sh; then
+    echo "Initial workflow finished. Scheduling future runs."
+  else
+    echo "Initial workflow failed after bounded retries; keeping the scheduler alive." >&2
+  fi
   cat <<EOC >/tmp/cronfile
 $CRON_EXPRESSION /bin/bash -lc "/app/docker/run-sync.sh"
 EOC
